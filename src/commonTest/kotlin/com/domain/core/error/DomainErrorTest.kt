@@ -2,6 +2,7 @@ package com.domain.core.error
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 
 class DomainErrorTest {
@@ -41,5 +42,120 @@ class DomainErrorTest {
         val error = DomainError.Unauthorized()
         assertEquals("Unauthorized", error.detail)
         assertEquals("Unauthorized", error.message)
+    }
+
+    // ── Data class structural equality ────────────────────────────────────────
+
+    @Test
+    fun `Validation equality is structural — same field and detail are equal`() {
+        val a = DomainError.Validation("email", "must be valid")
+        val b = DomainError.Validation("email", "must be valid")
+        assertEquals(a, b)
+        assertEquals(a.hashCode(), b.hashCode())
+    }
+
+    @Test
+    fun `Validation equality distinguishes different fields`() {
+        val a = DomainError.Validation("email", "required")
+        val b = DomainError.Validation("phone", "required")
+        assertNotEquals(a, b)
+    }
+
+    @Test
+    fun `Validation equality distinguishes different details`() {
+        val a = DomainError.Validation("email", "required")
+        val b = DomainError.Validation("email", "must be valid")
+        assertNotEquals(a, b)
+    }
+
+    @Test
+    fun `NotFound equality is structural`() {
+        val a = DomainError.NotFound("User", "123")
+        val b = DomainError.NotFound("User", "123")
+        assertEquals(a, b)
+    }
+
+    @Test
+    fun `NotFound equality distinguishes different ids`() {
+        assertEquals(
+            DomainError.NotFound("User", "1"),
+            DomainError.NotFound("User", "1"),
+        )
+        assertNotEquals(
+            DomainError.NotFound("User", "1"),
+            DomainError.NotFound("User", "2"),
+        )
+    }
+
+    @Test
+    fun `Conflict equality is structural`() {
+        val a = DomainError.Conflict(detail = "duplicate")
+        val b = DomainError.Conflict(detail = "duplicate")
+        assertEquals(a, b)
+        assertEquals(a.hashCode(), b.hashCode())
+    }
+
+    @Test
+    fun `Unauthorized equality is structural`() {
+        assertEquals(DomainError.Unauthorized(), DomainError.Unauthorized())
+        assertEquals(
+            DomainError.Unauthorized("custom"),
+            DomainError.Unauthorized("custom"),
+        )
+        assertNotEquals(DomainError.Unauthorized(), DomainError.Unauthorized("custom"))
+    }
+
+    // ── Subtypes without cause ────────────────────────────────────────────────
+
+    @Test
+    fun `Validation has no cause property`() {
+        val error = DomainError.Validation("f", "d")
+        // cause is not part of Validation — verifying message is synthesised correctly
+        assertEquals("'f' d", error.message)
+    }
+
+    @Test
+    fun `Conflict has no cause property — message is detail`() {
+        val error = DomainError.Conflict(detail = "state mismatch")
+        assertEquals("state mismatch", error.message)
+    }
+
+    @Test
+    fun `Infrastructure cause is null when not provided`() {
+        val error = DomainError.Infrastructure(detail = "oops")
+        assertNull(error.cause)
+    }
+
+    @Test
+    fun `Unknown cause is null when not provided`() {
+        assertNull(DomainError.Unknown().cause)
+    }
+
+    // ── Sealed when exhaustiveness ────────────────────────────────────────────
+
+    @Test
+    fun `when over DomainError is exhaustive — all branches reachable`() {
+        val errors: List<DomainError> = listOf(
+            DomainError.Validation("f", "d"),
+            DomainError.NotFound("T", "1"),
+            DomainError.Unauthorized(),
+            DomainError.Conflict(detail = "c"),
+            DomainError.Infrastructure(detail = "i"),
+            DomainError.Unknown(),
+        )
+        val labels = errors.map { error ->
+            when (error) {
+                is DomainError.Validation -> "Validation"
+                is DomainError.NotFound -> "NotFound"
+                is DomainError.Unauthorized -> "Unauthorized"
+                is DomainError.Conflict -> "Conflict"
+                is DomainError.Infrastructure -> "Infrastructure"
+                is DomainError.Unknown -> "Unknown"
+            }
+        }
+        assertEquals(
+            listOf("Validation", "NotFound", "Unauthorized", "Conflict", "Infrastructure", "Unknown"),
+            labels,
+        )
     }
 }
