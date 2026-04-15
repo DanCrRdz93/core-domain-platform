@@ -13,15 +13,21 @@ package com.domain.core.provider
  * - No dependency on `java.util.UUID` or any platform API inside the domain.
  *   The platform-specific UUID/ULID generation lives in the data/infra layer.
  *
- * Production wiring example (data/app layer, NOT here):
+ * Production wiring (data/app layer, NOT here):
  * ```kotlin
+ * // JVM / Android:
  * val idProvider: IdProvider = IdProvider { java.util.UUID.randomUUID().toString() }
+ * // iOS (via kotlinx or platform interop):
+ * val idProvider: IdProvider = IdProvider { platform.Foundation.NSUUID().UUIDString }
+ * // Any platform — sequential for deterministic ordering:
+ * var counter = 0L
+ * val seqProvider: IdProvider = IdProvider { "${++counter}" }
  * ```
  *
- * Test wiring example:
+ * Test wiring (zero dependencies, fully deterministic):
  * ```kotlin
  * var counter = 0
- * val sequentialId: IdProvider = IdProvider { "id-${++counter}" }
+ * val testIds: IdProvider = IdProvider { "id-${++counter}" }
  * ```
  */
 public fun interface IdProvider {
