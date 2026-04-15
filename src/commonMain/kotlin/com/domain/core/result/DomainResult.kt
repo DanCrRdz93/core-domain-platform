@@ -70,6 +70,39 @@ public inline fun <T> DomainResult<T>.onFailure(action: (DomainError) -> Unit): 
     return this
 }
 
+// ── Combination ──────────────────────────────────────────────────────────────
+
+/**
+ * Combines two [DomainResult] values into a single result using [transform].
+ * Fails with the first [DomainError] encountered if either operand is a failure.
+ *
+ * Design rationale:
+ * - Replaces deeply nested `flatMap` chains when multiple independent results
+ *   need to be combined: `zip(a, b) { x, y -> ... }` reads linearly.
+ * - Fail-fast: [b] is still evaluated (both are already computed values, not
+ *   lazy), but the error of [this] is returned first if both fail.
+ * - Does not allocate intermediate pairs or tuples.
+ */
+public inline fun <A, B, R> DomainResult<A>.zip(
+    other: DomainResult<B>,
+    transform: (A, B) -> R,
+): DomainResult<R> = when {
+    this is DomainResult.Success && other is DomainResult.Success -> transform(value, other.value).asSuccess()
+    this is DomainResult.Failure -> this
+    else -> other as DomainResult.Failure
+}
+
+/**
+ * Combines three [DomainResult] values. See [zip] for design rationale.
+ */
+public inline fun <A, B, C, R> DomainResult<A>.zip(
+    b: DomainResult<B>,
+    c: DomainResult<C>,
+    transform: (A, B, C) -> R,
+): DomainResult<R> = zip(b) { a, bVal -> a to bVal }.flatMap { (a, bVal) ->
+    c.map { cVal -> transform(a, bVal, cVal) }
+}
+
 // ── Lifting ──────────────────────────────────────────────────────────────────
 
 /**

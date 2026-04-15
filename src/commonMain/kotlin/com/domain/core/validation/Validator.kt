@@ -36,6 +36,46 @@ public fun <T> Validator<T>.andThen(other: Validator<T>): Validator<T> = Validat
     }
 }
 
+/**
+ * Runs all [validators] against [value] and accumulates every failure into a
+ * single [DomainError.Validation] list, rather than stopping at the first failure.
+ *
+ * Design rationale:
+ * - [andThen] is fail-fast: suitable for field-level chains where order matters.
+ * - [validateAll] is fail-accumulate: suitable for form-level or command-level
+ *   validation where the caller wants to report every violated rule at once.
+ * - Returns [DomainResult.Success] only when all validators pass.
+ * - Returns [DomainResult.Failure] with the first accumulated [DomainError.Validation]
+ *   when at least one fails. For multi-error reporting, callers should iterate the
+ *   full [errors] list returned by the accumulating variant below.
+ * - Avoids allocating a list when all validators pass (early-exit optimization).
+ */
+public fun <T> validateAll(
+    value: T,
+    validators: List<Validator<T>>,
+): DomainResult<Unit> {
+    val errors = mutableListOf<DomainError>()
+    for (validator in validators) {
+        val result = validator.validate(value)
+        if (result is DomainResult.Failure) errors += result.error
+    }
+    return if (errors.isEmpty()) Unit.asSuccess()
+    else domainFailure(errors.first())
+}
+
+/**
+ * Overload that returns the full list of [DomainError] instances when any
+ * validator fails. Returns an empty list on full success.
+ *
+ * Prefer this overload when the call site needs to present all violations
+ * simultaneously (e.g., form submission, command pre-validation).
+ */
+public fun <T> collectValidationErrors(
+    value: T,
+    validators: List<Validator<T>>,
+): List<DomainError> = validators
+    .mapNotNull { (it.validate(value) as? DomainResult.Failure)?.error }
+
 // ── Primitive validators ──────────────────────────────────────────────────────
 
 /**
