@@ -19,7 +19,7 @@ import com.domain.core.provider.IdProvider
  *   creation and every timestamped operation depends on them.
  *   Passing them individually to every use case constructor creates N×2 noise.
  *   Grouping them in a single value eliminates the noise without introducing
- *   abstraction cost: the type is concrete, sealed, and its fields are typed
+ *   abstraction cost: the type is concrete and final, and its fields are typed
  *   interfaces, not `Any`.
  *
  * ─ No business-feature repositories or gateways here.

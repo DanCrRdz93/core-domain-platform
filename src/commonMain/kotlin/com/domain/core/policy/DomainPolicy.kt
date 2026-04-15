@@ -1,5 +1,6 @@
 package com.domain.core.policy
 
+import com.domain.core.error.DomainError
 import com.domain.core.result.DomainResult
 import com.domain.core.result.asSuccess
 import com.domain.core.result.domainFailure

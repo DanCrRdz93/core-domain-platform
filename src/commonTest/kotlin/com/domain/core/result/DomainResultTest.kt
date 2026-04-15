@@ -219,6 +219,18 @@ class DomainResultTest {
         assertTrue(error.cause is IllegalStateException)
     }
 
+    @Test
+    fun `runDomainCatching rethrows CancellationException — structured concurrency`() = kotlinx.coroutines.test.runTest {
+        val thrown = kotlinx.coroutines.CancellationException("job cancelled")
+        var caught: Throwable? = null
+        try {
+            runDomainCatching { throw thrown }
+        } catch (e: Throwable) {
+            caught = e
+        }
+        assertSame(thrown, caught)
+    }
+
     // ── TestDoubles assertion helpers ─────────────────────────────────────────
 
     @Test

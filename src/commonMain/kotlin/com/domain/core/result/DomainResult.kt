@@ -1,6 +1,7 @@
 package com.domain.core.result
 
 import com.domain.core.error.DomainError
+import kotlinx.coroutines.CancellationException
 
 /**
  * A domain-owned Result type that explicitly models success or failure
@@ -121,6 +122,8 @@ public suspend fun <T> runDomainCatching(
     block: suspend () -> T,
 ): DomainResult<T> = try {
     block().asSuccess()
+} catch (e: CancellationException) {
+    throw e
 } catch (e: Throwable) {
     DomainResult.Failure(errorMapper(e))
 }
