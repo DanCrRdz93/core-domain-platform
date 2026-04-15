@@ -47,11 +47,3 @@ public interface WriteRepository<in T> : Repository {
     public suspend fun delete(entity: T): DomainResult<Unit>
 }
 
-/**
- * Composite contract combining read-by-id and write operations.
- * Use this only when the aggregate genuinely requires both from a single
- * repository boundary. Do not use it to avoid declaring separate interfaces.
- */
-public interface ReadWriteRepository<in ID, T> :
-    ReadRepository<ID, T>,
-    WriteRepository<T>

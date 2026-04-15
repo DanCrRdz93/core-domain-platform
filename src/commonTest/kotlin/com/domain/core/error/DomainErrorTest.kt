@@ -7,10 +7,11 @@ import kotlin.test.assertNull
 class DomainErrorTest {
 
     @Test
-    fun `Validation error carries field and message`() {
-        val error = DomainError.Validation(field = "email", message = "Invalid email")
+    fun `Validation error carries field and produces message`() {
+        val error = DomainError.Validation(field = "email", detail = "must be a valid address")
         assertEquals("email", error.field)
-        assertEquals("Invalid email", error.message)
+        assertEquals("must be a valid address", error.detail)
+        assertEquals("'email' must be a valid address", error.message)
     }
 
     @Test
@@ -22,13 +23,15 @@ class DomainErrorTest {
     @Test
     fun `Infrastructure error wraps cause`() {
         val cause = RuntimeException("db failure")
-        val error = DomainError.Infrastructure(message = "Storage unavailable", cause = cause)
+        val error = DomainError.Infrastructure(detail = "Storage unavailable", cause = cause)
+        assertEquals("Storage unavailable", error.message)
         assertEquals(cause, error.cause)
     }
 
     @Test
     fun `Unknown error defaults to generic message`() {
         val error = DomainError.Unknown()
+        assertEquals("An unexpected error occurred.", error.detail)
         assertEquals("An unexpected error occurred.", error.message)
         assertNull(error.cause)
     }
@@ -36,6 +39,7 @@ class DomainErrorTest {
     @Test
     fun `Unauthorized has default message`() {
         val error = DomainError.Unauthorized()
+        assertEquals("Unauthorized", error.detail)
         assertEquals("Unauthorized", error.message)
     }
 }

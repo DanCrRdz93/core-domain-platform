@@ -7,7 +7,7 @@ import kotlin.test.assertIs
 
 class DomainResultZipTest {
 
-    private val err = DomainError.Unknown("e")
+    private val err = DomainError.Unknown(detail = "e")
 
     @Test
     fun `zip two successes applies transform`() {

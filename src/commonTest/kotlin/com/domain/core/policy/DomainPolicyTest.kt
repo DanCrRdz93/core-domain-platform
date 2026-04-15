@@ -11,7 +11,7 @@ class DomainPolicyTest {
 
     private val alwaysSatisfied: DomainPolicy<Int> = DomainPolicy { Unit.asSuccess() }
     private val alwaysViolated: DomainPolicy<Int> = DomainPolicy {
-        domainFailure(DomainError.Conflict("violated"))
+        domainFailure(DomainError.Conflict(detail = "violated"))
     }
 
     @Test
@@ -68,13 +68,13 @@ class DomainPolicyTest {
 
     @Test
     fun `negate - satisfied policy becomes violated`() {
-        val negated = alwaysSatisfied.negate(domainFailure(DomainError.Conflict("negated")))
+        val negated = alwaysSatisfied.negate { DomainError.Conflict(detail = "negated") }
         assertIs<DomainResult.Failure>(negated.evaluate(1))
     }
 
     @Test
     fun `negate - violated policy becomes satisfied`() {
-        val negated = alwaysViolated.negate(domainFailure(DomainError.Conflict("negated")))
+        val negated = alwaysViolated.negate { DomainError.Conflict(detail = "negated") }
         assertIs<DomainResult.Success<Unit>>(negated.evaluate(1))
     }
 }

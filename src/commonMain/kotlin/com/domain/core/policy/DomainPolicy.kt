@@ -2,6 +2,7 @@ package com.domain.core.policy
 
 import com.domain.core.result.DomainResult
 import com.domain.core.result.asSuccess
+import com.domain.core.result.domainFailure
 
 /**
  * Contract for a domain policy — a named business rule that evaluates
@@ -66,11 +67,14 @@ public infix fun <C> DomainPolicy<C>.or(other: DomainPolicy<C>): DomainPolicy<C>
 
 /**
  * Returns a policy that is satisfied when [this] is NOT satisfied, and vice versa.
- * The negated failure message is preserved from the original policy's success path,
- * so callers must provide a meaningful error when using [not] by wrapping the result.
+ *
+ * [onSatisfied] is called only when the original policy passes (and the negated
+ * policy should therefore fail), producing the [DomainError] that describes why
+ * the negation is violated. This signature prevents the accidental mistake of
+ * passing a [DomainResult.Success] as the failure result.
  */
 public fun <C> DomainPolicy<C>.negate(
-    failureResult: DomainResult<Unit>,
+    onSatisfied: () -> DomainError,
 ): DomainPolicy<C> = DomainPolicy { context ->
-    if (evaluate(context).isFailure) Unit.asSuccess() else failureResult
+    if (evaluate(context).isFailure) Unit.asSuccess() else domainFailure(onSatisfied())
 }

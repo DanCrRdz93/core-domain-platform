@@ -94,13 +94,18 @@ public inline fun <A, B, R> DomainResult<A>.zip(
 
 /**
  * Combines three [DomainResult] values. See [zip] for design rationale.
+ * No intermediate Pair is allocated: all three operands are inspected directly.
  */
 public inline fun <A, B, C, R> DomainResult<A>.zip(
     b: DomainResult<B>,
     c: DomainResult<C>,
     transform: (A, B, C) -> R,
-): DomainResult<R> = zip(b) { a, bVal -> a to bVal }.flatMap { (a, bVal) ->
-    c.map { cVal -> transform(a, bVal, cVal) }
+): DomainResult<R> = when {
+    this is DomainResult.Success && b is DomainResult.Success && c is DomainResult.Success ->
+        transform(value, b.value, c.value).asSuccess()
+    this is DomainResult.Failure -> this
+    b is DomainResult.Failure -> b
+    else -> c as DomainResult.Failure
 }
 
 // ── Lifting ──────────────────────────────────────────────────────────────────

@@ -32,7 +32,7 @@ class DomainResultTest {
 
     @Test
     fun `map preserves failure`() {
-        val error = DomainError.Validation("field", "bad")
+        val error = DomainError.Validation("field", "is bad")
         val result = domainFailure(error).map { "should not reach" }
         assertEquals(error, (result as DomainResult.Failure).error)
     }
@@ -82,8 +82,8 @@ class DomainResultTest {
 
     @Test
     fun `mapError transforms error`() {
-        val original = DomainError.Unknown("original")
-        val mapped = domainFailure(original).mapError { DomainError.Conflict("mapped") }
+        val original = DomainError.Unknown(detail = "original")
+        val mapped = domainFailure(original).mapError { DomainError.Conflict(detail = "mapped") }
         val error = (mapped as DomainResult.Failure).error
         assertIs<DomainError.Conflict>(error)
         assertEquals("mapped", error.message)
@@ -98,7 +98,7 @@ class DomainResultTest {
     @Test
     fun `runDomainCatching maps thrown exception to DomainError`() = kotlinx.coroutines.test.runTest {
         val result = runDomainCatching(
-            errorMapper = { DomainError.Infrastructure("infra error", it) }
+            errorMapper = { DomainError.Infrastructure(detail = "infra error", cause = it) }
         ) {
             error("boom")
         }

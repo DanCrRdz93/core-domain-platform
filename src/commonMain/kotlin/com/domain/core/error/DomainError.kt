@@ -5,15 +5,16 @@ package com.domain.core.error
  *
  * Design rationale:
  * - Sealed ensures exhaustive handling at call sites without casting.
- * - No stack traces or platform types: domain errors carry only semantic meaning.
- * - [cause] is optional and typed as [Throwable] to avoid platform leakage while
- *   still allowing wrapping of infrastructure errors for debugging purposes.
- * - Subclasses are kept final (data class / object) to prevent uncontrolled extension.
+ * - [message] is declared on the sealed parent as a non-open val: subclasses
+ *   pass their message to the super constructor and do not redeclare it as a
+ *   property, avoiding the `override val` anti-pattern on sealed hierarchies.
+ * - [cause] is intentionally absent from the sealed base. Only [Infrastructure]
+ *   and [Unknown] carry a cause — they are the only subtypes that wrap external
+ *   exceptions. Exposing cause on [Validation], [NotFound], etc. would pollute
+ *   pure domain errors with infrastructure semantics.
+ * - Subclasses are final (data class) to prevent uncontrolled extension.
  */
-public sealed class DomainError(
-    public open val message: String,
-    public open val cause: Throwable? = null,
-) {
+public sealed class DomainError(public val message: String) {
 
     /**
      * The input provided does not satisfy domain invariants.
@@ -21,8 +22,8 @@ public sealed class DomainError(
      */
     public data class Validation(
         val field: String,
-        override val message: String,
-    ) : DomainError(message)
+        val detail: String,
+    ) : DomainError(message = "'$field' $detail")
 
     /**
      * The requested resource or aggregate does not exist.
@@ -36,16 +37,16 @@ public sealed class DomainError(
      * The caller is not authorised to perform the requested operation.
      */
     public data class Unauthorized(
-        override val message: String = "Unauthorized",
-    ) : DomainError(message)
+        val detail: String = "Unauthorized",
+    ) : DomainError(message = detail)
 
     /**
      * The operation conflicts with the current state of the domain.
      * E.g., duplicate entity, invalid state transition.
      */
     public data class Conflict(
-        override val message: String,
-    ) : DomainError(message)
+        val detail: String,
+    ) : DomainError(message = detail)
 
     /**
      * A downstream dependency (repository, gateway) failed in a way that
@@ -53,16 +54,16 @@ public sealed class DomainError(
      * exposing infrastructure types.
      */
     public data class Infrastructure(
-        override val message: String,
-        override val cause: Throwable? = null,
-    ) : DomainError(message, cause)
+        val detail: String,
+        val cause: Throwable? = null,
+    ) : DomainError(message = detail)
 
     /**
      * A catch-all for unexpected domain conditions not covered above.
      * Usage should be rare; prefer a specific subclass.
      */
     public data class Unknown(
-        override val message: String = "An unexpected error occurred.",
-        override val cause: Throwable? = null,
-    ) : DomainError(message, cause)
+        val detail: String = "An unexpected error occurred.",
+        val cause: Throwable? = null,
+    ) : DomainError(message = detail)
 }

@@ -4,18 +4,21 @@ import com.domain.core.result.DomainResult
 import kotlinx.coroutines.flow.Flow
 
 /**
- * Synchronous use case. Executes a pure computation with no side effects
- * and no I/O. Returns a [DomainResult] to allow validation or business-rule
- * failures without throwing.
+ * Synchronous, pure use case. Executes an in-memory computation with no
+ * side effects and no I/O. Returns a [DomainResult] to allow validation or
+ * business-rule failures without throwing.
  *
  * Design rationale:
+ * - Named [PureUseCase] to make the no-I/O constraint explicit. A consumer
+ *   who reaches for this type knows it is safe to call from any context,
+ *   including UI threads, without blocking concerns.
  * - `fun interface` enables SAM-style instantiation for testing: no anonymous
  *   class boilerplate, no lambda type erasure issues.
  * - Single [invoke] operator keeps call sites clean: `useCase(params)`.
  * - [I] = input params type; [O] = output type.
  *   Use [Unit] for parameterless or side-effect-only variants.
  */
-public fun interface UseCase<in I, out O> {
+public fun interface PureUseCase<in I, out O> {
     public operator fun invoke(params: I): DomainResult<O>
 }
 

@@ -54,13 +54,14 @@ public fun <T> validateAll(
     value: T,
     validators: List<Validator<T>>,
 ): DomainResult<Unit> {
-    val errors = mutableListOf<DomainError>()
+    var firstError: DomainError? = null
     for (validator in validators) {
         val result = validator.validate(value)
-        if (result is DomainResult.Failure) errors += result.error
+        if (result is DomainResult.Failure && firstError == null) {
+            firstError = result.error
+        }
     }
-    return if (errors.isEmpty()) Unit.asSuccess()
-    else domainFailure(errors.first())
+    return if (firstError == null) Unit.asSuccess() else domainFailure(firstError)
 }
 
 /**
@@ -83,7 +84,7 @@ public fun <T> collectValidationErrors(
  */
 public fun notBlankValidator(field: String): Validator<String> = Validator { value ->
     if (value.isNotBlank()) Unit.asSuccess()
-    else domainFailure(DomainError.Validation(field = field, message = "'$field' must not be blank."))
+    else domainFailure(DomainError.Validation(field = field, detail = "must not be blank."))
 }
 
 /**
@@ -94,7 +95,7 @@ public fun maxLengthValidator(field: String, maxLength: Int): Validator<String> 
     else domainFailure(
         DomainError.Validation(
             field = field,
-            message = "'$field' must not exceed $maxLength characters.",
+            detail = "must not exceed $maxLength characters.",
         )
     )
 }
@@ -107,7 +108,7 @@ public fun minLengthValidator(field: String, minLength: Int): Validator<String> 
     else domainFailure(
         DomainError.Validation(
             field = field,
-            message = "'$field' must have at least $minLength characters.",
+            detail = "must have at least $minLength characters.",
         )
     )
 }
@@ -125,7 +126,7 @@ public fun <T : Comparable<T>> rangeValidator(
     else domainFailure(
         DomainError.Validation(
             field = field,
-            message = "'$field' must be between $min and $max.",
+            detail = "must be between $min and $max.",
         )
     )
 }
