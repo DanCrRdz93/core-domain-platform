@@ -24,6 +24,7 @@ Dependencias: kotlinx-coroutines-core (única)
 - [Vista General de Arquitectura](#vista-general-de-arquitectura)
 - [Estructura de Paquetes](#estructura-de-paquetes)
 - [Componentes Principales](#componentes-principales)
+- [DomainDependencies](#domaindependencies--el-contenedor-de-infraestructura-del-dominio)
 - [Referencia Completa de Casos de Uso](#referencia-completa-de-casos-de-uso)
 - [Guía de Implementación Paso a Paso](#guía-de-implementación-paso-a-paso)
 - [Guía de Integración Android](#guía-de-integración-android)
@@ -208,6 +209,86 @@ sequenceDiagram
     Data-->>Repo: DomainResult<Unit>
     Repo-->>UC: DomainResult<Unit>
     UC-->>App: DomainResult<User>
+```
+
+---
+
+## DomainDependencies — El Contenedor de Infraestructura del Dominio
+
+`DomainDependencies` es un `data class` inmutable que agrupa las **dos únicas dependencias de infraestructura** que el dominio necesita universalmente:
+
+```kotlin
+public data class DomainDependencies(
+    val clock: ClockProvider,    // ¿Qué hora es?
+    val idProvider: IdProvider,  // Dame un ID único
+)
+```
+
+### El problema que resuelve
+
+Cada vez que un caso de uso crea una entidad necesita un **ID** y un **timestamp**. Sin `DomainDependencies`:
+
+```kotlin
+// ❌ Impuro — side-effects directos dentro del dominio
+val task = Task(
+    id = TaskId(UUID.randomUUID().toString()),   // acoplado a JVM, no compila en iOS
+    createdAt = System.currentTimeMillis(),        // resultado distinto en cada ejecución
+)
+```
+
+**Problemas:** No testeable (cada ejecución genera valores distintos → imposible `assertEquals`), acoplado a plataforma (no compila en iOS), y no reproducible.
+
+Con `DomainDependencies`:
+
+```kotlin
+// ✅ Determinista — el dominio no sabe de dónde vienen los valores
+val task = Task(
+    id = TaskId(deps.idProvider.next()),
+    createdAt = deps.clock.nowMillis(),
+)
+```
+
+### Cómo se configura
+
+**En producción** — la app crea una sola instancia y la pasa a todos los use cases:
+
+```kotlin
+// Android (Application.onCreate) o iOS (AppDelegate)
+val domainDeps = DomainDependencies(
+    clock = ClockProvider { System.currentTimeMillis() },
+    idProvider = IdProvider { UUID.randomUUID().toString() },
+)
+```
+
+**En tests** — valores fijos, resultados 100% reproducibles:
+
+```kotlin
+val testDeps = DomainDependencies(
+    clock = ClockProvider { 1_700_000_000_000L },
+    idProvider = IdProvider { "fixed-id-123" },
+)
+
+// Ahora puedes verificar con exactitud:
+val result = createTask(CreateTaskParams("Comprar leche"))
+val task = result.getOrNull()!!
+assertEquals("fixed-id-123", task.id.value)          // ✅ siempre pasa
+assertEquals(1_700_000_000_000L, task.createdAt)     // ✅ siempre pasa
+```
+
+### ¿Por qué agruparlos en un solo objeto?
+
+Si tienes 20 use cases que crean entidades, sin `DomainDependencies` pasarías `clock` + `idProvider` como **40 parámetros individuales**. Con el contenedor, son **20 parámetros** (`deps`).
+
+### ¿Qué NO va aquí?
+
+Repositorios y gateways de features se inyectan **directamente** en cada use case. Solo va aquí lo **cross-cutting** (que prácticamente todos los use cases necesitan):
+
+```kotlin
+class PlaceOrderUseCase(
+    private val deps: DomainDependencies,          // ✅ cross-cutting: clock + id
+    private val orderRepository: OrderRepository,  // ✅ específico de esta feature
+    private val inventoryGateway: SuspendGateway<...>,
+) : SuspendUseCase<PlaceOrderParams, Order> { ... }
 ```
 
 ---
@@ -1090,6 +1171,86 @@ sequenceDiagram
     Data-->>Repo: DomainResult<Unit>
     Repo-->>UC: DomainResult<Unit>
     UC-->>App: DomainResult<User>
+```
+
+---
+
+## DomainDependencies — The Domain Infrastructure Container
+
+`DomainDependencies` is an immutable `data class` that groups the **only two infrastructure dependencies** the domain needs universally:
+
+```kotlin
+public data class DomainDependencies(
+    val clock: ClockProvider,    // What time is it?
+    val idProvider: IdProvider,  // Give me a unique ID
+)
+```
+
+### The problem it solves
+
+Every time a use case creates an entity it needs an **ID** and a **timestamp**. Without `DomainDependencies`:
+
+```kotlin
+// ❌ Impure — direct side-effects inside the domain
+val task = Task(
+    id = TaskId(UUID.randomUUID().toString()),   // coupled to JVM, won't compile on iOS
+    createdAt = System.currentTimeMillis(),        // different result every execution
+)
+```
+
+**Problems:** Not testable (every run generates different values → impossible to `assertEquals`), platform-coupled (won't compile on iOS), and not reproducible.
+
+With `DomainDependencies`:
+
+```kotlin
+// ✅ Deterministic — the domain doesn't know where the values come from
+val task = Task(
+    id = TaskId(deps.idProvider.next()),
+    createdAt = deps.clock.nowMillis(),
+)
+```
+
+### How to configure it
+
+**Production** — the app creates a single instance and passes it to all use cases:
+
+```kotlin
+// Android (Application.onCreate) or iOS (AppDelegate)
+val domainDeps = DomainDependencies(
+    clock = ClockProvider { System.currentTimeMillis() },
+    idProvider = IdProvider { UUID.randomUUID().toString() },
+)
+```
+
+**Tests** — fixed values, 100% reproducible results:
+
+```kotlin
+val testDeps = DomainDependencies(
+    clock = ClockProvider { 1_700_000_000_000L },
+    idProvider = IdProvider { "fixed-id-123" },
+)
+
+// Now you can verify with precision:
+val result = createTask(CreateTaskParams("Buy milk"))
+val task = result.getOrNull()!!
+assertEquals("fixed-id-123", task.id.value)          // ✅ always passes
+assertEquals(1_700_000_000_000L, task.createdAt)     // ✅ always passes
+```
+
+### Why group them in a single object?
+
+If you have 20 use cases that create entities, without `DomainDependencies` you'd pass `clock` + `idProvider` as **40 individual parameters**. With the container, it's **20 parameters** (`deps`).
+
+### What does NOT go here?
+
+Feature repositories and gateways are injected **directly** into each use case. Only **cross-cutting** dependencies (needed by virtually all use cases) belong here:
+
+```kotlin
+class PlaceOrderUseCase(
+    private val deps: DomainDependencies,          // ✅ cross-cutting: clock + id
+    private val orderRepository: OrderRepository,  // ✅ feature-specific
+    private val inventoryGateway: SuspendGateway<...>,
+) : SuspendUseCase<PlaceOrderParams, Order> { ... }
 ```
 
 ---
