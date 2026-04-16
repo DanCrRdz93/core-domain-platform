@@ -3,49 +3,41 @@
 [← Volver al README](README.md)
 
 ![Platform](https://img.shields.io/badge/platform-iOS-blue)
+![Kotlin](https://img.shields.io/badge/Kotlin-2.0.21-purple)
+
+> Esta guía cubre **exclusivamente el SDK de dominio** y cómo usarlo desde un proyecto iOS (Swift).
+> No cubre implementaciones de capa de datos (SQLDelight, CoreData, Ktor) ni vistas SwiftUI.
 
 ---
 
-## Arquitectura en iOS
+## Tabla de Contenidos
 
-```mermaid
-graph TB
-    subgraph "App iOS (Swift)"
-        VIEW["SwiftUI View"]
-        VM_IOS["ObservableObject / ViewModel"]
-        FACTORY["Module Factory"]
-    end
-
-    subgraph "Módulo KMP Compartido"
-        UC_IOS["SuspendUseCase"]
-        DEPS_IOS["DomainDependencies"]
-        MOD_IOS["FeatureDomainModule"]
-    end
-
-    subgraph "Capa de Datos (KMP shared)"
-        CD["CoreData / SQLDelight"]
-        URL["URLSession / Ktor"]
-        REPO_IOS["RepositoryImpl"]
-    end
-
-    VIEW --> VM_IOS
-    VM_IOS --> UC_IOS
-    FACTORY --> MOD_IOS
-    FACTORY --> DEPS_IOS
-    MOD_IOS --> UC_IOS
-    REPO_IOS --> CD
-    REPO_IOS --> URL
-
-    style UC_IOS fill:#4CAF50,color:#fff
-    style VM_IOS fill:#FF9800,color:#fff
-    style REPO_IOS fill:#2196F3,color:#fff
-```
+- [Exportar framework KMP](#paso-1--exportar-framework-kmp)
+- [Contratos del SDK](#paso-2--contratos-del-sdk)
+  - [Tipos de Use Case](#tipos-de-use-case)
+  - [DomainResult](#domainresult)
+  - [DomainError](#domainerror)
+  - [Modelo de dominio](#modelo-de-dominio)
+  - [Contratos de Repository y Gateway](#contratos-de-repository-y-gateway)
+  - [Validadores](#validadores)
+  - [Políticas de dominio](#políticas-de-dominio)
+  - [Providers](#providers)
+  - [DomainDependencies](#domaindependencies)
+- [Cómo se exponen los tipos en Swift](#paso-3--cómo-se-exponen-los-tipos-en-swift)
+- [Implementar un Use Case](#paso-4--implementar-un-use-case)
+- [Validación de input](#paso-5--validación-de-input)
+- [Políticas de negocio](#paso-6--políticas-de-negocio)
+- [Definir un Repository contract](#paso-7--definir-un-repository-contract)
+- [Cablear DomainDependencies para iOS](#paso-8--cablear-domaindependencies-para-ios)
+- [Inyectar Use Cases en el ViewModel](#paso-9--inyectar-use-cases-en-el-viewmodel)
+- [Testing de Use Cases](#paso-10--testing-de-use-cases)
+- [FAQ](#faq)
 
 ---
 
-## Paso I1 — Exportar framework KMP
+## Paso 1 — Exportar framework KMP
 
-**Escenario:** Tu proyecto KMP necesita exportar el módulo compartido como un framework iOS.
+Para que iOS pueda consumir el SDK, el módulo KMP debe exportar un framework:
 
 ```kotlin
 // shared/build.gradle.kts
@@ -59,11 +51,348 @@ kotlin {
 }
 ```
 
+Esto genera un framework que Swift importa con `import SharedDomain`.
+
 ---
 
-## Paso I2 — Providers de plataforma para iOS
+## Paso 2 — Contratos del SDK
 
-**Escenario:** Proveer implementaciones específicas de iOS usando Kotlin/Native.
+### Tipos de Use Case
+
+El SDK provee 5 contratos de caso de uso. Todos son `fun interface` (SAM):
+
+| Contrato | Firma (Kotlin) | Cuándo usar |
+|---|---|---|
+| `PureUseCase<I, O>` | `(I) → DomainResult<O>` | Lógica síncrona y pura. Sin I/O |
+| `SuspendUseCase<I, O>` | `suspend (I) → DomainResult<O>` | Operaciones async de resultado único |
+| `FlowUseCase<I, O>` | `(I) → Flow<DomainResult<O>>` | Observar cambios en el tiempo |
+| `NoParamsUseCase<O>` | `suspend () → DomainResult<O>` | Variante sin parámetros |
+| `NoParamsFlowUseCase<O>` | `() → Flow<DomainResult<O>>` | Variante reactiva sin parámetros |
+
+Todos retornan `DomainResult<T>`, nunca lanzan excepciones al consumidor.
+
+### DomainResult
+
+Tipo sealed que modela éxito o fallo **sin excepciones**:
+
+```kotlin
+sealed class DomainResult<out T> {
+    data class Success<out T>(val value: T) : DomainResult<T>()
+    data class Failure(val error: DomainError) : DomainResult<Nothing>()
+}
+```
+
+**Constructores:**
+```kotlin
+val ok = myValue.asSuccess()               // → Success(myValue)
+val fail = domainFailure(DomainError.NotFound(...))  // → Failure(...)
+```
+
+**Operadores funcionales:**
+```kotlin
+result
+    .map { task -> task.title }              // transforma el valor si es Success
+    .flatMap { title -> validateTitle(title) } // encadena otro DomainResult
+    .mapError { error -> enrichError(error) } // transforma el error si es Failure
+    .onSuccess { value -> log(value) }       // efecto lateral si Success
+    .onFailure { error -> track(error) }     // efecto lateral si Failure
+```
+
+**Extracción:**
+```kotlin
+result.getOrNull()                    // T? — null si Failure
+result.errorOrNull()                  // DomainError? — null si Success
+result.getOrElse { error -> default } // T — usa default si Failure
+```
+
+**Combinación con `zip`:**
+```kotlin
+validatedName.zip(validatedEmail) { name, email ->
+    CreateUserParams(name, email)
+}
+```
+
+**Captura segura con `runDomainCatching`:**
+```kotlin
+suspend fun <T> runDomainCatching(
+    errorMapper: (Throwable) -> DomainError = { DomainError.Unknown(cause = it) },
+    block: suspend () -> T,
+): DomainResult<T>
+```
+- Atrapa todo excepto `CancellationException` (preserva concurrencia estructurada)
+- Convierte excepciones a `DomainError` usando el mapper
+
+### DomainError
+
+Jerarquía sealed con 6 subtipos concretos:
+
+| Subtipo | Campos | Semántica |
+|---|---|---|
+| `Validation` | `field`, `detail` | Input no satisface invariantes de dominio |
+| `NotFound` | `resourceType`, `id` | Recurso/agregado no existe |
+| `Unauthorized` | `detail` | Operación no autorizada |
+| `Conflict` | `detail` | Conflicto con estado actual (duplicado, transición inválida) |
+| `Infrastructure` | `detail`, `cause?` | Fallo de dependencia externa |
+| `Unknown` | `detail`, `cause?` | Catch-all para condiciones inesperadas |
+
+Todos heredan `message: String`. Solo `Infrastructure` y `Unknown` exponen `cause: Throwable?`.
+
+### Modelo de dominio
+
+Tres interfaces marker para modelar DDD:
+
+| Interfaz | Propósito |
+|---|---|
+| `Entity<ID>` | Objeto con identidad (`val id: ID`). Igualdad por `id` |
+| `ValueObject` | Objeto inmutable sin identidad. Igualdad estructural |
+| `AggregateRoot<ID>` | Entidad que es raíz de consistencia. Los repositories operan contra estos |
+
+```kotlin
+// Value Object
+data class TaskId(val value: String) : ValueObject
+
+// Aggregate Root
+data class Task(
+    override val id: TaskId,
+    val title: String,
+    val completed: Boolean,
+    val createdAt: Long,
+) : AggregateRoot<TaskId>
+```
+
+### Contratos de Repository y Gateway
+
+**Repository** — abstracción sobre persistencia:
+
+| Contrato | Métodos |
+|---|---|
+| `Repository` | Marker puro (sin métodos) |
+| `ReadRepository<ID, T>` | `suspend findById(id): DomainResult<T?>` |
+| `ReadCollectionRepository<T>` | `observeAll(): Flow<DomainResult<List<T>>>` |
+| `WriteRepository<T>` | `suspend save(entity): DomainResult<Unit>`, `suspend delete(entity): DomainResult<Unit>` |
+
+**Gateway** — abstracción sobre capacidades externas (no persistencia):
+
+| Contrato | Métodos |
+|---|---|
+| `Gateway` | Marker puro |
+| `SuspendGateway<I, O>` | `suspend execute(input): DomainResult<O>` |
+| `CommandGateway<I>` | `suspend dispatch(input): DomainResult<Unit>` |
+
+> **El dominio define la interfaz; la capa de datos la implementa.**
+> El SDK nunca contiene implementaciones de repositories o gateways.
+
+### Validadores
+
+`Validator<T>` es un `fun interface` para validación síncrona y pura:
+
+```kotlin
+fun interface Validator<in T> {
+    fun validate(value: T): DomainResult<Unit>
+}
+```
+
+**Validadores primitivos incluidos:**
+- `notBlankValidator(field)` — String no vacío
+- `maxLengthValidator(field, max)` — longitud máxima
+- `minLengthValidator(field, min)` — longitud mínima
+- `rangeValidator(field, min, max)` — rango para Comparable
+
+**Composición:**
+```kotlin
+// Fail-fast
+val titleValidator = notBlankValidator("title")
+    .andThen(maxLengthValidator("title", 200))
+
+// Acumula todos los errores
+val errors: List<DomainError> = collectValidationErrors(title, validators)
+```
+
+### Políticas de dominio
+
+`DomainPolicy<C>` modela **reglas de negocio semánticas**:
+
+```kotlin
+fun interface DomainPolicy<in C> {
+    fun evaluate(context: C): DomainResult<Unit>
+}
+
+fun interface SuspendDomainPolicy<in C> {
+    suspend fun evaluate(context: C): DomainResult<Unit>
+}
+```
+
+Combinadores: `and`, `or`, `negate`.
+
+### Providers
+
+| Provider | Método | Propósito |
+|---|---|---|
+| `ClockProvider` | `nowMillis(): Long` | Obtener tiempo actual (epoch ms) |
+| `IdProvider` | `next(): String` | Generar ID único |
+
+El dominio nunca llama a APIs de plataforma directamente.
+
+### DomainDependencies
+
+Contenedor inmutable para providers cross-cutting:
+
+```kotlin
+data class DomainDependencies(
+    val clock: ClockProvider,
+    val idProvider: IdProvider,
+)
+```
+
+---
+
+## Paso 3 — Cómo se exponen los tipos en Swift
+
+Kotlin/Native genera clases Swift para cada tipo del SDK. Las convenciones de nombrado son:
+
+| Kotlin | Swift |
+|---|---|
+| `DomainResult.Success<T>` | `DomainResultSuccess<T>` |
+| `DomainResult.Failure` | `DomainResultFailure` |
+| `DomainError.Validation` | `DomainErrorValidation` |
+| `DomainError.NotFound` | `DomainErrorNotFound` |
+| `DomainError.Unauthorized` | `DomainErrorUnauthorized` |
+| `DomainError.Conflict` | `DomainErrorConflict` |
+| `DomainError.Infrastructure` | `DomainErrorInfrastructure` |
+| `DomainError.Unknown` | `DomainErrorUnknown` |
+| `suspend fun` | `async func` (Kotlin 2.0+) |
+| `Flow<T>` | `Kotlinx_coroutines_coreFlow` (usar SKIE o KMP-NativeCoroutines) |
+
+**Distinguir éxito de fallo en Swift:**
+```swift
+let result = try? await useCase.invoke(params: params)
+
+if let success = result as? DomainResultSuccess<Task> {
+    let task = success.value  // acceso al valor
+} else if let failure = result as? DomainResultFailure {
+    let error = failure.error // acceso al DomainError
+    if let validation = error as? DomainErrorValidation {
+        print(validation.field, validation.detail)
+    }
+}
+```
+
+**Manejo exhaustivo de errores:**
+```swift
+func handleError(_ error: DomainError) {
+    switch error {
+    case let validation as DomainErrorValidation:
+        showFieldError(validation.field, validation.detail)
+    case let notFound as DomainErrorNotFound:
+        showNotFound(notFound.resourceType)
+    case is DomainErrorUnauthorized:
+        navigateToLogin()
+    case let conflict as DomainErrorConflict:
+        showConflict(conflict.detail)
+    case is DomainErrorInfrastructure:
+        showRetry()
+    default:
+        showGenericError()
+    }
+}
+```
+
+---
+
+## Paso 4 — Implementar un Use Case
+
+Los use cases se implementan en Kotlin (en el módulo compartido), no en Swift:
+
+```kotlin
+class CreateTaskUseCase(
+    private val deps: DomainDependencies,
+    private val taskRepository: TaskRepository,
+    private val titleValidator: Validator<String>,
+) : SuspendUseCase<CreateTaskParams, Task> {
+
+    override suspend fun invoke(params: CreateTaskParams): DomainResult<Task> {
+        // 1. Validar input
+        titleValidator.validate(params.title).let { result ->
+            if (result.isFailure) return result as DomainResult.Failure
+        }
+
+        // 2. Construir agregado
+        val task = Task(
+            id = TaskId(deps.idProvider.next()),
+            title = params.title.trim(),
+            completed = false,
+            createdAt = deps.clock.nowMillis(),
+        )
+
+        // 3. Persistir
+        return taskRepository.save(task).map { task }
+    }
+}
+
+data class CreateTaskParams(val title: String)
+```
+
+**Puntos clave:**
+- El use case recibe `DomainDependencies` + contratos de repository por constructor
+- Usa `Validator` para validación de input
+- Usa `ClockProvider` e `IdProvider` — nunca APIs de plataforma
+- Retorna `DomainResult<Task>` — nunca lanza excepciones
+
+---
+
+## Paso 5 — Validación de input
+
+```kotlin
+// Componer validadores con andThen (fail-fast)
+val titleValidator = notBlankValidator("title")
+    .andThen(maxLengthValidator("title", 200))
+
+// Dentro del use case:
+titleValidator.validate(params.title).let { result ->
+    if (result.isFailure) return result as DomainResult.Failure
+}
+
+// O acumular todos los errores:
+val errors = collectValidationErrors(params.title, listOf(
+    notBlankValidator("title"),
+    minLengthValidator("title", 3),
+    maxLengthValidator("title", 200),
+))
+```
+
+---
+
+## Paso 6 — Políticas de negocio
+
+```kotlin
+val canCompleteTask = DomainPolicy<Task> { task ->
+    if (!task.completed) Unit.asSuccess()
+    else domainFailure(DomainError.Conflict(detail = "Tarea ya completada"))
+}
+
+// Componer:
+val canModifyTask = isNotCompletedPolicy and isNotArchivedPolicy
+```
+
+---
+
+## Paso 7 — Definir un Repository contract
+
+```kotlin
+// Dentro del dominio:
+interface TaskRepository : ReadRepository<TaskId, Task>, WriteRepository<Task> {
+    suspend fun findByStatus(completed: Boolean): DomainResult<List<Task>>
+}
+
+// La capa de datos implementa (fuera del SDK).
+// El SDK nunca conoce SQLDelight, CoreData, ni ninguna tecnología concreta.
+```
+
+---
+
+## Paso 8 — Cablear DomainDependencies para iOS
+
+En el código `iosMain` de tu módulo KMP compartido:
 
 ```kotlin
 // shared/src/iosMain/kotlin/PlatformProviders.kt
@@ -82,16 +411,10 @@ val iosIdProvider: IdProvider = IdProvider {
 }
 ```
 
----
-
-## Paso I3 — Factory de módulo para Swift
-
-**Escenario:** Swift no puede llamar constructores Kotlin con genéricos complejos directamente. Crea una función factory que Swift pueda invocar fácilmente.
+Luego crea un factory que Swift pueda invocar fácilmente:
 
 ```kotlin
 // shared/src/iosMain/kotlin/ModuleFactory.kt
-import com.domain.core.di.DomainDependencies
-
 object SharedModuleFactory {
 
     private val domainDeps = DomainDependencies(
@@ -100,58 +423,18 @@ object SharedModuleFactory {
     )
 
     fun createTaskModule(taskRepository: TaskRepository): TaskDomainModule =
-        TaskDomainModuleImpl(
-            deps = domainDeps,
-            taskRepository = taskRepository,
-        )
+        TaskDomainModuleImpl(deps = domainDeps, taskRepository = taskRepository)
 }
 ```
 
----
-
-## Paso I4 — Repositorio SQLDelight para iOS
-
-**Escenario:** Implementar `TaskRepository` con SQLDelight (persistencia nativa KMP).
-
-```kotlin
-// módulo data compartido
-class TaskRepositoryImpl(
-    private val queries: TaskQueries,
-) : TaskRepository {
-
-    override suspend fun findById(id: TaskId): DomainResult<Task?> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "Fallo al leer DB", cause = it) }
-        ) {
-            queries.findById(id.value).executeAsOneOrNull()?.toDomain()
-        }
-
-    override suspend fun save(entity: Task): DomainResult<Unit> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "Fallo al escribir DB", cause = it) }
-        ) {
-            queries.insertOrReplace(
-                id = entity.id.value,
-                title = entity.title,
-                completed = entity.completed,
-                createdAt = entity.createdAt,
-            )
-        }
-
-    override suspend fun delete(entity: Task): DomainResult<Unit> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "Fallo al eliminar en DB", cause = it) }
-        ) {
-            queries.deleteById(entity.id.value)
-        }
-}
-```
+> **¿Por qué un factory?** Swift no puede invocar directamente constructores Kotlin con
+> genéricos complejos. El factory expone una API limpia para Swift.
 
 ---
 
-## Paso I5 — Llamar desde Swift
+## Paso 9 — Inyectar Use Cases en el ViewModel
 
-**Escenario:** Usar el módulo de dominio desde un ViewModel SwiftUI.
+El ViewModel de Swift recibe **solo los contratos del SDK**, nunca implementaciones concretas:
 
 ```swift
 import SharedDomain
@@ -160,7 +443,7 @@ import SharedDomain
 class TaskViewModel: ObservableObject {
     @Published var state: TaskState = .idle
 
-    private let createTask: any SuspendUseCaseProtocol
+    private let createTask: SuspendUseCase // tipado del SDK
 
     init(taskModule: TaskDomainModule) {
         self.createTask = taskModule.createTask
@@ -175,191 +458,127 @@ class TaskViewModel: ObservableObject {
         if let success = result as? DomainResultSuccess<Task> {
             state = .success(success.value)
         } else if let failure = result as? DomainResultFailure {
-            if let validation = failure.error as? DomainErrorValidation {
-                state = .validationError(field: validation.field, detail: validation.detail)
-            } else {
-                state = .error(failure.error.message)
-            }
+            handleError(failure.error)
+        }
+    }
+
+    private func handleError(_ error: DomainError) {
+        if let validation = error as? DomainErrorValidation {
+            state = .validationError(field: validation.field, detail: validation.detail)
+        } else {
+            state = .error(error.message)
         }
     }
 }
-
-enum TaskState {
-    case idle
-    case loading
-    case success(Task)
-    case validationError(field: String, detail: String)
-    case error(String)
-}
 ```
+
+El ViewModel **no sabe** cómo se implementan los use cases, ni qué base de datos usan.
+Solo conoce los contratos del SDK.
 
 ---
 
-## Paso I6 — Vista SwiftUI
+## Paso 10 — Testing de Use Cases
 
-**Escenario:** Conectar el ViewModel a una vista SwiftUI.
+Los tests se escriben en Kotlin (`commonTest`), no en Swift:
 
-```swift
-struct CreateTaskView: View {
-    @StateObject private var viewModel: TaskViewModel
-    @State private var title = ""
+```kotlin
+class CreateTaskUseCaseTest {
 
-    init(taskModule: TaskDomainModule) {
-        _viewModel = StateObject(wrappedValue: TaskViewModel(taskModule: taskModule))
+    private val fixedDeps = DomainDependencies(
+        clock = ClockProvider { 1_700_000_000_000L },
+        idProvider = IdProvider { "test-id-1" },
+    )
+
+    // Stub simple — sin framework de mocking
+    private val fakeRepo = object : TaskRepository {
+        val saved = mutableListOf<Task>()
+        override suspend fun save(entity: Task) =
+            entity.also { saved.add(it) }.let { Unit.asSuccess() }
+        override suspend fun delete(entity: Task) = Unit.asSuccess()
+        override suspend fun findById(id: TaskId) = saved.find { it.id == id }.asSuccess()
+        override suspend fun findByStatus(completed: Boolean) =
+            saved.filter { it.completed == completed }.asSuccess()
     }
 
-    var body: some View {
-        VStack(spacing: 16) {
-            TextField("Título de la tarea", text: $title)
-                .textFieldStyle(.roundedBorder)
+    private val useCase = CreateTaskUseCase(
+        deps = fixedDeps,
+        taskRepository = fakeRepo,
+        titleValidator = notBlankValidator("title")
+            .andThen(maxLengthValidator("title", 200)),
+    )
 
-            Button("Crear Tarea") {
-                Task { await viewModel.onCreateTask(title: title) }
-            }
+    @Test
+    fun `crea tarea con título válido`() = runTest {
+        val result = useCase(CreateTaskParams("Mi tarea"))
 
-            switch viewModel.state {
-            case .idle:
-                EmptyView()
-            case .loading:
-                ProgressView()
-            case .success(let task):
-                Text("Creada: \(task.title)")
-            case .validationError(let field, let detail):
-                Text("\(field): \(detail)")
-                    .foregroundColor(.red)
-            case .error(let message):
-                Text(message)
-                    .foregroundColor(.red)
-            }
-        }
-        .padding()
-    }
-}
-```
-
----
-
-## Paso I7 — Wiring en el punto de entrada de la app
-
-**Escenario:** Crear el factory del módulo al iniciar la app.
-
-```swift
-@main
-struct MyApp: App {
-    private let taskModule: TaskDomainModule
-
-    init() {
-        let database = /* configuración de tu driver SQLDelight */
-        let taskRepo = TaskRepositoryImpl(queries: database.taskQueries)
-        taskModule = SharedModuleFactory().createTaskModule(taskRepository: taskRepo)
+        assertTrue(result.isSuccess)
+        assertEquals("test-id-1", result.getOrNull()!!.id.value)
     }
 
-    var body: some Scene {
-        WindowGroup {
-            CreateTaskView(taskModule: taskModule)
-        }
+    @Test
+    fun `falla con título en blanco`() = runTest {
+        val result = useCase(CreateTaskParams("   "))
+
+        assertTrue(result.isFailure)
+        assertTrue(result.errorOrNull() is DomainError.Validation)
     }
 }
 ```
+
+**Principios de testing:**
+- `DomainDependencies` con valores fijos → determinismo total
+- Stubs manuales → sin framework de mocking
+- `runTest` de kotlinx-coroutines-test para use cases suspend
 
 ---
 
 ## FAQ
 
 **P: ¿Cómo maneja Kotlin/Native las funciones `suspend` en Swift?**
-Kotlin 2.0+ genera funciones `async` de Swift para funciones `suspend` de Kotlin.
-Las llamas con `await` en Swift. No se necesitan wrappers de callback manuales.
+Kotlin 2.0+ genera funciones `async` de Swift. Las llamas con `await`. No se necesitan wrappers manuales.
 
 **P: ¿Cómo se exponen las sealed classes en Swift?**
-`DomainResult.Success` y `DomainResult.Failure` se convierten en clases separadas en Swift.
-Usa verificaciones `is` o casts `as?` para distinguirlas. Los subtipos de `DomainError`
-similarmente se convierten en clases separadas (`DomainErrorValidation`, `DomainErrorNotFound`, etc.).
+Se convierten en clases separadas. `DomainResult.Success` → `DomainResultSuccess`, etc.
+Usa casts `as?` para distinguirlas.
 
-**P: ¿Puedo usar esto con Combine en lugar de async/await?**
-Sí. Envuelve las llamadas `async` en publishers de Combine si tu proyecto aún usa Combine:
-```swift
-Future<Task, Error> { promise in
-    Task { /* llama al caso de uso async aquí */ }
-}
-```
-Sin embargo, `async/await` nativo es lo recomendado para proyectos nuevos.
+**P: ¿Qué pasa con los `Flow` use cases?**
+`Flow` se expone como `Kotlinx_coroutines_coreFlow`. Usa
+[KMP-NativeCoroutines](https://github.com/nicklockwood/KMP-NativeCoroutines) o SKIE
+para obtener wrappers nativos `AsyncSequence`.
 
-**P: ¿Necesito preocuparme por el manejo de memoria con objetos KMP?**
-Kotlin/Native usa conteo automático de referencias (ARC) para objetos expuestos a Swift.
-No se necesita manejo manual de memoria. Evita retener objetos Kotlin en closures
-de larga vida para prevenir ciclos de referencia.
-
-**P: ¿Qué pasa con los `Flow` use cases en iOS?**
-`Flow` se expone como `Kotlinx_coroutines_coreFlow` en Swift. Usa la librería
-[KMP-NativeCoroutines](https://github.com/nicklockwood/KMP-NativeCoroutines)
-o SKIE para obtener wrappers nativos de Swift `AsyncSequence`.
-
-**P: ¿El framework es grande?**
-El SDK de dominio es muy pequeño — solo interfaces tipadas, sealed classes y funciones puras.
-La contribución típica al tamaño del binario es menor a 100KB.
-
-**P: ¿Puedo usar SwiftUI previews con este SDK?**
-Sí. Crea módulos fake con repositorios stub para previews:
-```swift
-#Preview {
-    CreateTaskView(taskModule: FakeTaskDomainModule())
-}
-```
+**P: ¿Necesito preocuparme por el manejo de memoria?**
+Kotlin/Native usa ARC para objetos expuestos a Swift. Sin manejo manual.
+Evita retener objetos Kotlin en closures de larga vida.
 
 **P: ¿El SDK soporta watchOS / tvOS / macOS?**
-El código de dominio es Kotlin `commonMain` puro. Agrega los targets en `build.gradle.kts`
-y compilarán sin cambios:
+Sí. Agrega los targets en `build.gradle.kts`:
 ```kotlin
 watchosArm64()
 tvosArm64()
 macosArm64()
 ```
 
+**P: ¿El framework es grande?**
+Muy pequeño — solo interfaces tipadas, sealed classes y funciones puras. Menos de 100KB típico.
+
+**P: ¿El SDK contiene implementaciones de Repository?**
+No. Solo contratos (interfaces). La capa de datos provee las implementaciones.
+
+**P: ¿Cuál es la diferencia entre `Validator` y `DomainPolicy`?**
+`Validator` = restricciones sintácticas (no blank, max length).
+`DomainPolicy` = reglas de negocio semánticas (contexto de agregado/estado).
+
 ---
 
 <details>
 <summary><h2>🇺🇸 English Version</h2></summary>
 
-## Architecture on iOS
-
-```mermaid
-graph TB
-    subgraph "iOS App (Swift)"
-        VIEW["SwiftUI View"]
-        VM_IOS["ObservableObject / ViewModel"]
-        FACTORY["Module Factory"]
-    end
-
-    subgraph "Shared KMP Module"
-        UC_IOS["SuspendUseCase"]
-        DEPS_IOS["DomainDependencies"]
-        MOD_IOS["FeatureDomainModule"]
-    end
-
-    subgraph "Data Layer (KMP shared)"
-        CD["CoreData / SQLDelight"]
-        URL["URLSession / Ktor"]
-        REPO_IOS["RepositoryImpl"]
-    end
-
-    VIEW --> VM_IOS
-    VM_IOS --> UC_IOS
-    FACTORY --> MOD_IOS
-    FACTORY --> DEPS_IOS
-    MOD_IOS --> UC_IOS
-    REPO_IOS --> CD
-    REPO_IOS --> URL
-
-    style UC_IOS fill:#4CAF50,color:#fff
-    style VM_IOS fill:#FF9800,color:#fff
-    style REPO_IOS fill:#2196F3,color:#fff
-```
+> This guide covers **exclusively the domain SDK** and how to use it from an iOS (Swift) project.
+> It does not cover data layer implementations (SQLDelight, CoreData, Ktor) or SwiftUI views.
 
 ---
 
-## Step I1 — KMP framework export
-
-**Scenario:** Your KMP project needs to export the shared module as an iOS framework.
+## Step 1 — KMP framework export
 
 ```kotlin
 // shared/build.gradle.kts
@@ -373,247 +592,147 @@ kotlin {
 }
 ```
 
-## Step I2 — Platform providers for iOS
+---
 
-**Scenario:** Provide iOS-specific implementations using Kotlin/Native.
+## Step 2 — SDK Contracts
+
+### Use Case types
+
+5 `fun interface` contracts: `PureUseCase`, `SuspendUseCase`, `FlowUseCase`, `NoParamsUseCase`, `NoParamsFlowUseCase`.
+
+### DomainResult
+
+Sealed type: `Success<T>` / `Failure(error: DomainError)`.
+Operators: `map`, `flatMap`, `mapError`, `onSuccess`, `onFailure`, `getOrNull`, `getOrElse`, `zip`, `runDomainCatching`.
+
+### DomainError
+
+6 subtypes: `Validation`, `NotFound`, `Unauthorized`, `Conflict`, `Infrastructure`, `Unknown`.
+
+### Domain Model
+
+`Entity<ID>`, `ValueObject`, `AggregateRoot<ID>`.
+
+### Repository & Gateway contracts
+
+Repositories: `ReadRepository`, `ReadCollectionRepository`, `WriteRepository`.
+Gateways: `SuspendGateway`, `CommandGateway`. SDK defines interfaces only.
+
+### Validators & Policies
+
+`Validator<T>` (syntactic). `DomainPolicy<C>` / `SuspendDomainPolicy<C>` (semantic).
+
+### Providers & DomainDependencies
+
+`ClockProvider`, `IdProvider`, grouped in `DomainDependencies`.
+
+---
+
+## Step 3 — How types are exposed in Swift
+
+| Kotlin | Swift |
+|---|---|
+| `DomainResult.Success<T>` | `DomainResultSuccess<T>` |
+| `DomainResult.Failure` | `DomainResultFailure` |
+| `DomainError.Validation` | `DomainErrorValidation` |
+| `suspend fun` | `async func` (Kotlin 2.0+) |
+| `Flow<T>` | `Kotlinx_coroutines_coreFlow` (use SKIE or KMP-NativeCoroutines) |
+
+---
+
+## Step 4 — Implement a Use Case (in Kotlin)
+
+```kotlin
+class CreateTaskUseCase(
+    private val deps: DomainDependencies,
+    private val taskRepository: TaskRepository,
+    private val titleValidator: Validator<String>,
+) : SuspendUseCase<CreateTaskParams, Task> {
+    override suspend fun invoke(params: CreateTaskParams): DomainResult<Task> {
+        titleValidator.validate(params.title).let { if (it.isFailure) return it as DomainResult.Failure }
+        val task = Task(
+            id = TaskId(deps.idProvider.next()),
+            title = params.title.trim(),
+            completed = false,
+            createdAt = deps.clock.nowMillis(),
+        )
+        return taskRepository.save(task).map { task }
+    }
+}
+```
+
+---
+
+## Step 5 — Wire DomainDependencies for iOS
 
 ```kotlin
 // shared/src/iosMain/kotlin/PlatformProviders.kt
-import com.domain.core.provider.ClockProvider
-import com.domain.core.provider.IdProvider
-import platform.Foundation.NSDate
-import platform.Foundation.NSUUID
-import platform.Foundation.timeIntervalSince1970
-
 val iosClock: ClockProvider = ClockProvider {
     (NSDate().timeIntervalSince1970 * 1000).toLong()
 }
-
-val iosIdProvider: IdProvider = IdProvider {
-    NSUUID().UUIDString
-}
+val iosIdProvider: IdProvider = IdProvider { NSUUID().UUIDString }
 ```
 
-## Step I3 — Module factory for Swift
-
-**Scenario:** Swift cannot call Kotlin constructors with complex generics directly.
-Create a factory function that Swift can call easily.
+Factory for Swift consumption:
 
 ```kotlin
-// shared/src/iosMain/kotlin/ModuleFactory.kt
-import com.domain.core.di.DomainDependencies
-
 object SharedModuleFactory {
-
-    private val domainDeps = DomainDependencies(
-        clock = iosClock,
-        idProvider = iosIdProvider,
-    )
-
+    private val domainDeps = DomainDependencies(clock = iosClock, idProvider = iosIdProvider)
     fun createTaskModule(taskRepository: TaskRepository): TaskDomainModule =
-        TaskDomainModuleImpl(
-            deps = domainDeps,
-            taskRepository = taskRepository,
-        )
+        TaskDomainModuleImpl(deps = domainDeps, taskRepository = taskRepository)
 }
 ```
 
-## Step I4 — SQLDelight repository for iOS
+---
 
-**Scenario:** Implement `TaskRepository` with SQLDelight (KMP-native persistence).
-
-```kotlin
-// shared data module
-class TaskRepositoryImpl(
-    private val queries: TaskQueries,
-) : TaskRepository {
-
-    override suspend fun findById(id: TaskId): DomainResult<Task?> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "DB read failed", cause = it) }
-        ) {
-            queries.findById(id.value).executeAsOneOrNull()?.toDomain()
-        }
-
-    override suspend fun save(entity: Task): DomainResult<Unit> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "DB write failed", cause = it) }
-        ) {
-            queries.insertOrReplace(
-                id = entity.id.value,
-                title = entity.title,
-                completed = entity.completed,
-                createdAt = entity.createdAt,
-            )
-        }
-
-    override suspend fun delete(entity: Task): DomainResult<Unit> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "DB delete failed", cause = it) }
-        ) {
-            queries.deleteById(entity.id.value)
-        }
-}
-```
-
-## Step I5 — Calling from Swift
-
-**Scenario:** Use the domain module from a SwiftUI ViewModel.
+## Step 6 — Inject Use Cases into the ViewModel
 
 ```swift
-import SharedDomain
-
 @MainActor
 class TaskViewModel: ObservableObject {
-    @Published var state: TaskState = .idle
-
-    private let createTask: any SuspendUseCaseProtocol
+    private let createTask: SuspendUseCase
 
     init(taskModule: TaskDomainModule) {
         self.createTask = taskModule.createTask
     }
 
     func onCreateTask(title: String) async {
-        state = .loading
-
-        let params = CreateTaskParams(title: title)
-        let result = try? await createTask.invoke(params: params)
-
+        let result = try? await createTask.invoke(params: CreateTaskParams(title: title))
         if let success = result as? DomainResultSuccess<Task> {
-            state = .success(success.value)
+            // handle success
         } else if let failure = result as? DomainResultFailure {
-            if let validation = failure.error as? DomainErrorValidation {
-                state = .validationError(field: validation.field, detail: validation.detail)
-            } else {
-                state = .error(failure.error.message)
-            }
-        }
-    }
-}
-
-enum TaskState {
-    case idle
-    case loading
-    case success(Task)
-    case validationError(field: String, detail: String)
-    case error(String)
-}
-```
-
-## Step I6 — SwiftUI View
-
-**Scenario:** Connect the ViewModel to a SwiftUI View.
-
-```swift
-struct CreateTaskView: View {
-    @StateObject private var viewModel: TaskViewModel
-    @State private var title = ""
-
-    init(taskModule: TaskDomainModule) {
-        _viewModel = StateObject(wrappedValue: TaskViewModel(taskModule: taskModule))
-    }
-
-    var body: some View {
-        VStack(spacing: 16) {
-            TextField("Task title", text: $title)
-                .textFieldStyle(.roundedBorder)
-
-            Button("Create Task") {
-                Task { await viewModel.onCreateTask(title: title) }
-            }
-
-            switch viewModel.state {
-            case .idle:
-                EmptyView()
-            case .loading:
-                ProgressView()
-            case .success(let task):
-                Text("Created: \(task.title)")
-            case .validationError(let field, let detail):
-                Text("\(field): \(detail)")
-                    .foregroundColor(.red)
-            case .error(let message):
-                Text(message)
-                    .foregroundColor(.red)
-            }
-        }
-        .padding()
-    }
-}
-```
-
-## Step I7 — App entry point wiring
-
-**Scenario:** Create the module factory at app launch.
-
-```swift
-@main
-struct MyApp: App {
-    private let taskModule: TaskDomainModule
-
-    init() {
-        let database = /* your SQLDelight driver setup */
-        let taskRepo = TaskRepositoryImpl(queries: database.taskQueries)
-        taskModule = SharedModuleFactory().createTaskModule(taskRepository: taskRepo)
-    }
-
-    var body: some Scene {
-        WindowGroup {
-            CreateTaskView(taskModule: taskModule)
+            // handle error
         }
     }
 }
 ```
+
+---
+
+## Step 7 — Testing (in Kotlin commonTest)
+
+```kotlin
+private val fixedDeps = DomainDependencies(
+    clock = ClockProvider { 1_700_000_000_000L },
+    idProvider = IdProvider { "test-id-1" },
+)
+// Manual stubs — no mocking framework needed
+```
+
+---
 
 ## FAQ
 
-**Q: How does Kotlin/Native handle `suspend` functions in Swift?**
-Kotlin 2.0+ generates Swift `async` functions for `suspend` Kotlin functions.
-You call them with `await` in Swift. No manual callback wrappers needed.
+**Q: How does Kotlin/Native handle `suspend` in Swift?** Generates `async` functions. Use `await`.
 
-**Q: How are sealed classes exposed in Swift?**
-`DomainResult.Success` and `DomainResult.Failure` become separate classes in Swift.
-Use `is` checks or `as?` casts to distinguish them. `DomainError` subtypes
-similarly become separate classes (`DomainErrorValidation`, `DomainErrorNotFound`, etc.).
+**Q: How are sealed classes exposed?** As separate classes (e.g., `DomainResultSuccess`, `DomainErrorValidation`).
 
-**Q: Can I use this with Combine instead of async/await?**
-Yes. Wrap the `async` calls in Combine publishers if your project still uses Combine:
-```swift
-Future<Task, Error> { promise in
-    Task { /* call the async use case here */ }
-}
-```
-However, native `async/await` is recommended for new projects.
+**Q: What about `Flow` use cases?** Use KMP-NativeCoroutines or SKIE for `AsyncSequence` wrappers.
 
-**Q: Do I need to worry about memory management with KMP objects?**
-Kotlin/Native uses automatic reference counting (ARC) for objects exposed to Swift.
-No manual memory management is needed. Avoid retaining Kotlin objects in long-lived
-closures to prevent reference cycles.
+**Q: Memory management?** ARC. No manual management needed.
 
-**Q: What about `Flow` use cases on iOS?**
-`Flow` is exposed as `Kotlinx_coroutines_coreFlow` in Swift. Use the
-[KMP-NativeCoroutines](https://github.com/nicklockwood/KMP-NativeCoroutines) library
-or SKIE to get native Swift `AsyncSequence` wrappers.
+**Q: Does the SDK contain Repository implementations?** No. Only contracts.
 
-**Q: Is the framework size large?**
-The domain SDK is very small — only typed interfaces, sealed classes, and pure functions.
-Typical binary size contribution is under 100KB.
-
-**Q: Can I use SwiftUI previews with this SDK?**
-Yes. Create fake modules with stub repositories for previews:
-```swift
-#Preview {
-    CreateTaskView(taskModule: FakeTaskDomainModule())
-}
-```
-
-**Q: Does the SDK support watchOS / tvOS / macOS?**
-The domain code is pure `commonMain` Kotlin. Add the targets in `build.gradle.kts`
-and they will compile without changes:
-```kotlin
-watchosArm64()
-tvosArm64()
-macosArm64()
-```
+**Q: Supports watchOS / tvOS / macOS?** Yes. Add targets in `build.gradle.kts`.
 
 </details>

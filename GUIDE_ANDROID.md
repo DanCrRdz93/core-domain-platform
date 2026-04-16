@@ -3,123 +3,416 @@
 [← Volver al README](README.md)
 
 ![Platform](https://img.shields.io/badge/platform-Android-green)
+![Kotlin](https://img.shields.io/badge/Kotlin-2.0.21-purple)
+
+> Esta guía cubre **exclusivamente el SDK de dominio** y cómo usarlo en un proyecto Android.
+> No cubre implementaciones de capa de datos (Room, Ktor, Retrofit) ni UI (Compose, XML).
 
 ---
 
-## Arquitectura en Android
+## Tabla de Contenidos
 
-```mermaid
-graph TB
-    subgraph "App Android"
-        ACT["Activity / Fragment"]
-        VM["ViewModel"]
-        HILT["Hilt / Koin / DI Manual"]
-    end
-
-    subgraph "Domain SDK"
-        UC["SuspendUseCase"]
-        DEPS["DomainDependencies"]
-        MOD["FeatureDomainModule"]
-    end
-
-    subgraph "Capa de Datos"
-        ROOM["Room Database"]
-        KTOR["Ktor Client"]
-        REPOIMPL["RepositoryImpl"]
-    end
-
-    ACT --> VM
-    VM --> UC
-    HILT --> MOD
-    HILT --> DEPS
-    MOD --> UC
-    REPOIMPL --> ROOM
-    REPOIMPL --> KTOR
-
-    style UC fill:#4CAF50,color:#fff
-    style VM fill:#FF9800,color:#fff
-    style REPOIMPL fill:#2196F3,color:#fff
-```
+- [Dependencia de Gradle](#paso-1--dependencia-de-gradle)
+- [Contratos del SDK](#paso-2--contratos-del-sdk)
+  - [Tipos de Use Case](#tipos-de-use-case)
+  - [DomainResult](#domainresult)
+  - [DomainError](#domainerror)
+  - [Modelo de dominio](#modelo-de-dominio)
+  - [Contratos de Repository y Gateway](#contratos-de-repository-y-gateway)
+  - [Validadores](#validadores)
+  - [Políticas de dominio](#políticas-de-dominio)
+  - [Providers](#providers)
+  - [DomainDependencies](#domaindependencies)
+- [Implementar un Use Case](#paso-3--implementar-un-use-case)
+- [Validación de input](#paso-4--validación-de-input)
+- [Políticas de negocio](#paso-5--políticas-de-negocio)
+- [Definir un Repository contract](#paso-6--definir-un-repository-contract)
+- [Cablear DomainDependencies](#paso-7--cablear-domaindependencies)
+- [Inyectar Use Cases en el ViewModel](#paso-8--inyectar-use-cases-en-el-viewmodel)
+- [Testing de Use Cases](#paso-9--testing-de-use-cases)
+- [FAQ](#faq)
 
 ---
 
-## Paso A1 — Configuración de Gradle
-
-**Escenario:** Tu app Android tiene un módulo `:app` y quiere usar el SDK.
+## Paso 1 — Dependencia de Gradle
 
 ```kotlin
 // app/build.gradle.kts
 dependencies {
     implementation(project(":coredomainplatform"))
+    // Única dependencia transitiva del SDK:
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 }
 ```
 
+El SDK es `commonMain` puro. No trae dependencias de Android, ni Room, ni Ktor, ni UI.
+
 ---
 
-## Paso A2 — Providers de plataforma
+## Paso 2 — Contratos del SDK
 
-**Escenario:** Proveer implementaciones específicas de Android para `ClockProvider` e `IdProvider`.
+### Tipos de Use Case
+
+El SDK provee 5 contratos de caso de uso. Todos son `fun interface` (SAM):
+
+| Contrato | Firma | Cuándo usar |
+|---|---|---|
+| `PureUseCase<I, O>` | `(I) → DomainResult<O>` | Lógica síncrona y pura. Sin I/O. Seguro desde main thread |
+| `SuspendUseCase<I, O>` | `suspend (I) → DomainResult<O>` | Operaciones async de resultado único (crear, actualizar, buscar) |
+| `FlowUseCase<I, O>` | `(I) → Flow<DomainResult<O>>` | Observar cambios en el tiempo (streams reactivos) |
+| `NoParamsUseCase<O>` | `suspend () → DomainResult<O>` | Variante sin parámetros de `SuspendUseCase` |
+| `NoParamsFlowUseCase<O>` | `() → Flow<DomainResult<O>>` | Variante sin parámetros de `FlowUseCase` |
+
+Todos retornan `DomainResult<T>`, nunca lanzan excepciones al consumidor.
 
 ```kotlin
-// módulo data — AndroidProviders.kt
-import com.domain.core.provider.ClockProvider
-import com.domain.core.provider.IdProvider
-import java.util.UUID
-
-val androidClock: ClockProvider = ClockProvider {
-    System.currentTimeMillis()
+// Ejemplo: caso de uso síncrono puro
+val calculateDiscount = PureUseCase<Order, Money> { order ->
+    Money(order.total.amount * 0.1).asSuccess()
 }
 
-val androidIdProvider: IdProvider = IdProvider {
-    UUID.randomUUID().toString()
+// Ejemplo: caso de uso suspendido
+val createTask = SuspendUseCase<CreateTaskParams, Task> { params ->
+    // validar → aplicar política → guardar → retornar
+}
+```
+
+### DomainResult
+
+Tipo sealed que modela éxito o fallo **sin excepciones**:
+
+```kotlin
+sealed class DomainResult<out T> {
+    data class Success<out T>(val value: T) : DomainResult<T>()
+    data class Failure(val error: DomainError) : DomainResult<Nothing>()
+}
+```
+
+**Constructores:**
+```kotlin
+val ok = myValue.asSuccess()               // → Success(myValue)
+val fail = domainFailure(DomainError.NotFound(...))  // → Failure(...)
+```
+
+**Operadores funcionales:**
+```kotlin
+result
+    .map { task -> task.title }              // transforma el valor si es Success
+    .flatMap { title -> validateTitle(title) } // encadena otro DomainResult
+    .mapError { error -> enrichError(error) } // transforma el error si es Failure
+    .onSuccess { value -> log(value) }       // efecto lateral si Success
+    .onFailure { error -> track(error) }     // efecto lateral si Failure
+```
+
+**Extracción:**
+```kotlin
+result.getOrNull()                    // T? — null si Failure
+result.errorOrNull()                  // DomainError? — null si Success
+result.getOrElse { error -> default } // T — usa default si Failure
+```
+
+**Combinación con `zip`:**
+```kotlin
+validatedName.zip(validatedEmail) { name, email ->
+    CreateUserParams(name, email)
+}
+// Falla con el primer error encontrado si alguno es Failure
+```
+
+**Captura segura con `runDomainCatching`:**
+```kotlin
+suspend fun <T> runDomainCatching(
+    errorMapper: (Throwable) -> DomainError = { DomainError.Unknown(cause = it) },
+    block: suspend () -> T,
+): DomainResult<T>
+```
+- Atrapa todo excepto `CancellationException` (preserva concurrencia estructurada)
+- Convierte excepciones a `DomainError` usando el mapper
+
+### DomainError
+
+Jerarquía sealed con 6 subtipos concretos:
+
+| Subtipo | Campos | Semántica |
+|---|---|---|
+| `Validation` | `field`, `detail` | Input no satisface invariantes de dominio |
+| `NotFound` | `resourceType`, `id` | Recurso/agregado no existe |
+| `Unauthorized` | `detail` | Operación no autorizada |
+| `Conflict` | `detail` | Conflicto con estado actual (duplicado, transición inválida) |
+| `Infrastructure` | `detail`, `cause?` | Fallo de dependencia externa |
+| `Unknown` | `detail`, `cause?` | Catch-all para condiciones inesperadas |
+
+Todos heredan `message: String`. Solo `Infrastructure` y `Unknown` exponen `cause: Throwable?`.
+
+```kotlin
+// Manejo exhaustivo
+when (error) {
+    is DomainError.Validation -> showFieldError(error.field, error.detail)
+    is DomainError.NotFound -> showNotFound(error.resourceType)
+    is DomainError.Unauthorized -> navigateToLogin()
+    is DomainError.Conflict -> showConflict(error.detail)
+    is DomainError.Infrastructure -> showRetry()
+    is DomainError.Unknown -> showGenericError()
+}
+```
+
+### Modelo de dominio
+
+Tres interfaces marker para modelar DDD:
+
+| Interfaz | Propósito |
+|---|---|
+| `Entity<ID>` | Objeto con identidad (`val id: ID`). Igualdad por `id` |
+| `ValueObject` | Objeto inmutable sin identidad. Igualdad estructural |
+| `AggregateRoot<ID>` | Entidad que es raíz de consistencia. Los repositories operan contra estos |
+
+```kotlin
+// Value Object
+data class TaskId(val value: String) : ValueObject
+
+// Aggregate Root
+data class Task(
+    override val id: TaskId,
+    val title: String,
+    val completed: Boolean,
+    val createdAt: Long,
+) : AggregateRoot<TaskId>
+```
+
+### Contratos de Repository y Gateway
+
+**Repository** — abstracción sobre persistencia:
+
+| Contrato | Métodos |
+|---|---|
+| `Repository` | Marker puro (sin métodos) |
+| `ReadRepository<ID, T>` | `suspend findById(id): DomainResult<T?>` |
+| `ReadCollectionRepository<T>` | `observeAll(): Flow<DomainResult<List<T>>>` |
+| `WriteRepository<T>` | `suspend save(entity): DomainResult<Unit>`, `suspend delete(entity): DomainResult<Unit>` |
+
+**Gateway** — abstracción sobre capacidades externas (no persistencia):
+
+| Contrato | Métodos |
+|---|---|
+| `Gateway` | Marker puro |
+| `SuspendGateway<I, O>` | `suspend execute(input): DomainResult<O>` |
+| `CommandGateway<I>` | `suspend dispatch(input): DomainResult<Unit>` |
+
+> **El dominio define la interfaz; la capa de datos la implementa.**
+> El SDK nunca contiene implementaciones de repositories o gateways.
+
+```kotlin
+// El dominio define:
+interface TaskRepository : ReadRepository<TaskId, Task>, WriteRepository<Task>
+
+// La capa de datos implementa (fuera del SDK):
+class TaskRepositoryImpl(...) : TaskRepository { ... }
+```
+
+### Validadores
+
+`Validator<T>` es un `fun interface` para validación síncrona y pura:
+
+```kotlin
+fun interface Validator<in T> {
+    fun validate(value: T): DomainResult<Unit>
+}
+```
+
+**Validadores primitivos incluidos:**
+- `notBlankValidator(field)` — String no vacío
+- `maxLengthValidator(field, max)` — longitud máxima
+- `minLengthValidator(field, min)` — longitud mínima
+- `rangeValidator(field, min, max)` — rango para Comparable
+
+**Composición:**
+```kotlin
+// Fail-fast: se detiene en el primer error
+val titleValidator = notBlankValidator("title")
+    .andThen(maxLengthValidator("title", 200))
+
+// Acumula todos los errores
+val errors: List<DomainError> = collectValidationErrors(title, listOf(
+    notBlankValidator("title"),
+    maxLengthValidator("title", 200),
+    minLengthValidator("title", 3),
+))
+```
+
+### Políticas de dominio
+
+`DomainPolicy<C>` modela **reglas de negocio semánticas** (a diferencia de validadores que son sintácticos):
+
+```kotlin
+fun interface DomainPolicy<in C> {
+    fun evaluate(context: C): DomainResult<Unit>
+}
+```
+
+**Variante async** para reglas que requieren I/O:
+```kotlin
+fun interface SuspendDomainPolicy<in C> {
+    suspend fun evaluate(context: C): DomainResult<Unit>
+}
+```
+
+**Combinadores:**
+```kotlin
+val canPromote = isActivePolicy and hasMinTenurePolicy    // ambas deben pasar
+val canAccess = isAdminPolicy or isOwnerPolicy             // al menos una
+val cannotBeArchived = isArchivedPolicy.negate {
+    DomainError.Conflict(detail = "Ya está archivado")
+}
+```
+
+### Providers
+
+Dos abstracciones para side effects que el dominio necesita:
+
+| Provider | Método | Propósito |
+|---|---|---|
+| `ClockProvider` | `nowMillis(): Long` | Obtener tiempo actual (epoch ms) |
+| `IdProvider` | `next(): String` | Generar ID único |
+
+Ambos son `fun interface`. El dominio nunca llama a `System.currentTimeMillis()` ni `UUID.randomUUID()` directamente.
+
+### DomainDependencies
+
+Contenedor inmutable para providers cross-cutting:
+
+```kotlin
+data class DomainDependencies(
+    val clock: ClockProvider,
+    val idProvider: IdProvider,
+)
+```
+
+Se crea **una sola vez** al inicio de la app y se pasa a todos los módulos de dominio.
+
+---
+
+## Paso 3 — Implementar un Use Case
+
+```kotlin
+class CreateTaskUseCase(
+    private val deps: DomainDependencies,
+    private val taskRepository: TaskRepository,
+    private val titleValidator: Validator<String>,
+) : SuspendUseCase<CreateTaskParams, Task> {
+
+    override suspend fun invoke(params: CreateTaskParams): DomainResult<Task> {
+        // 1. Validar input
+        titleValidator.validate(params.title).let { result ->
+            if (result.isFailure) return result as DomainResult.Failure
+        }
+
+        // 2. Construir agregado
+        val task = Task(
+            id = TaskId(deps.idProvider.next()),
+            title = params.title.trim(),
+            completed = false,
+            createdAt = deps.clock.nowMillis(),
+        )
+
+        // 3. Persistir (delega al contrato de repository)
+        return taskRepository.save(task).map { task }
+    }
+}
+
+data class CreateTaskParams(val title: String)
+```
+
+**Puntos clave:**
+- El use case recibe `DomainDependencies` + contratos de repository/gateway por constructor
+- Usa `Validator` para validación de input
+- Usa `ClockProvider` e `IdProvider` del `DomainDependencies` — nunca APIs de plataforma
+- Retorna `DomainResult<Task>` — nunca lanza excepciones
+
+---
+
+## Paso 4 — Validación de input
+
+```kotlin
+// Componer validadores con andThen (fail-fast)
+val titleValidator = notBlankValidator("title")
+    .andThen(maxLengthValidator("title", 200))
+
+// Dentro del use case:
+titleValidator.validate(params.title).let { result ->
+    if (result.isFailure) return result as DomainResult.Failure
+}
+
+// O validar múltiples campos acumulando errores:
+val errors = collectValidationErrors(params.title, listOf(
+    notBlankValidator("title"),
+    minLengthValidator("title", 3),
+    maxLengthValidator("title", 200),
+))
+if (errors.isNotEmpty()) {
+    return domainFailure(errors.first())
 }
 ```
 
 ---
 
-## Paso A3 — Implementación de repositorio con Room
-
-**Escenario:** Implementar `TaskRepository` respaldado por Room.
+## Paso 5 — Políticas de negocio
 
 ```kotlin
-// módulo data — TaskRepositoryImpl.kt
-class TaskRepositoryImpl(
-    private val dao: TaskDao,
-) : TaskRepository {
-
-    override suspend fun findById(id: TaskId): DomainResult<Task?> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "Fallo al leer DB", cause = it) }
-        ) {
-            dao.findById(id.value)?.toDomain()
-        }
-
-    override suspend fun save(entity: Task): DomainResult<Unit> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "Fallo al escribir DB", cause = it) }
-        ) {
-            dao.insertOrReplace(entity.toEntity())
-        }
-
-    override suspend fun delete(entity: Task): DomainResult<Unit> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "Fallo al eliminar en DB", cause = it) }
-        ) {
-            dao.delete(entity.id.value)
-        }
+// Política: no se puede completar una tarea ya completada
+val canCompleteTask = DomainPolicy<Task> { task ->
+    if (!task.completed) Unit.asSuccess()
+    else domainFailure(DomainError.Conflict(detail = "Tarea ya completada"))
 }
+
+// Usar dentro de un use case:
+canCompleteTask.evaluate(existingTask).let { result ->
+    if (result.isFailure) return result as DomainResult.Failure
+}
+
+// Componer políticas:
+val canModifyTask = isNotCompletedPolicy and isNotArchivedPolicy
 ```
 
 ---
 
-## Paso A4 — Integración con ViewModel
+## Paso 6 — Definir un Repository contract
 
-**Escenario:** Un ViewModel llama a un caso de uso y mapea el resultado a estado de UI.
+```kotlin
+// Dentro del dominio (este módulo o tu feature module):
+interface TaskRepository : ReadRepository<TaskId, Task>, WriteRepository<Task> {
+    suspend fun findByStatus(completed: Boolean): DomainResult<List<Task>>
+}
+
+// La capa de datos (fuera del SDK) implementa este contrato.
+// El SDK nunca conoce Room, Ktor, ni ninguna tecnología concreta.
+```
+
+---
+
+## Paso 7 — Cablear DomainDependencies
+
+```kotlin
+// En Application.onCreate() o tu entrypoint:
+val domainDeps = DomainDependencies(
+    clock = ClockProvider { System.currentTimeMillis() },
+    idProvider = IdProvider { UUID.randomUUID().toString() },
+)
+```
+
+Esto es lo **único** que necesitas del SDK a nivel de wiring. Los repositories son contratos
+que tu capa de datos implementa e inyecta en los use cases.
+
+---
+
+## Paso 8 — Inyectar Use Cases en el ViewModel
+
+El ViewModel recibe **solo los contratos** del SDK (interfaces `SuspendUseCase`, `FlowUseCase`, etc.),
+nunca implementaciones concretas:
 
 ```kotlin
 class TaskViewModel(
     private val createTask: SuspendUseCase<CreateTaskParams, Task>,
+    private val observeTasks: NoParamsFlowUseCase<List<Task>>,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow<TaskUiState>(TaskUiState.Idle)
@@ -137,8 +430,6 @@ class TaskViewModel(
                     _uiState.value = when (error) {
                         is DomainError.Validation ->
                             TaskUiState.ValidationError(error.field, error.detail)
-                        is DomainError.Infrastructure ->
-                            TaskUiState.Error("Algo salió mal. Intenta de nuevo.")
                         else ->
                             TaskUiState.Error(error.message)
                     }
@@ -146,192 +437,108 @@ class TaskViewModel(
         }
     }
 }
-
-sealed interface TaskUiState {
-    data object Idle : TaskUiState
-    data object Loading : TaskUiState
-    data class Success(val task: Task) : TaskUiState
-    data class ValidationError(val field: String, val detail: String) : TaskUiState
-    data class Error(val message: String) : TaskUiState
-}
 ```
+
+El ViewModel **no sabe** cómo se implementan los use cases, ni qué base de datos usan,
+ni de dónde vienen los datos. Solo conoce los contratos del SDK.
 
 ---
 
-## Paso A5 — Wiring manual (sin framework DI)
-
-**Escenario:** Conectar todo sin Koin ni Hilt.
+## Paso 9 — Testing de Use Cases
 
 ```kotlin
-// AppModule.kt — crear una vez en Application.onCreate()
-class AppModule(context: Context) {
+class CreateTaskUseCaseTest {
 
-    private val database = Room.databaseBuilder(
-        context, AppDatabase::class.java, "app.db"
-    ).build()
-
-    private val domainDeps = DomainDependencies(
-        clock = androidClock,
-        idProvider = androidIdProvider,
+    private val fixedDeps = DomainDependencies(
+        clock = ClockProvider { 1_700_000_000_000L },
+        idProvider = IdProvider { "test-id-1" },
     )
 
-    private val taskRepository: TaskRepository = TaskRepositoryImpl(database.taskDao())
-
-    val taskModule: TaskDomainModule = TaskDomainModuleImpl(
-        deps = domainDeps,
-        taskRepository = taskRepository,
-    )
-}
-
-// En tu Activity o Fragment:
-val appModule = (application as MyApp).appModule
-val viewModel = TaskViewModel(createTask = appModule.taskModule.createTask)
-```
-
----
-
-## Paso A6 — Wiring con Hilt (opcional)
-
-**Escenario:** Prefieres Hilt para DI en Android.
-
-```kotlin
-@Module
-@InstallIn(SingletonComponent::class)
-object DomainModule {
-
-    @Provides @Singleton
-    fun provideDomainDeps(): DomainDependencies = DomainDependencies(
-        clock = androidClock,
-        idProvider = androidIdProvider,
-    )
-
-    @Provides @Singleton
-    fun provideTaskModule(
-        deps: DomainDependencies,
-        taskRepository: TaskRepository,
-    ): TaskDomainModule = TaskDomainModuleImpl(deps, taskRepository)
-
-    @Provides
-    fun provideCreateTask(module: TaskDomainModule): SuspendUseCase<CreateTaskParams, Task> =
-        module.createTask
-}
-```
-
----
-
-## Paso A7 — Wiring con Koin (opcional)
-
-**Escenario:** Prefieres Koin para DI en Android.
-
-```kotlin
-val domainModule = module {
-    single {
-        DomainDependencies(
-            clock = androidClock,
-            idProvider = androidIdProvider,
-        )
+    // Stub simple — sin framework de mocking
+    private val fakeRepo = object : TaskRepository {
+        val saved = mutableListOf<Task>()
+        override suspend fun save(entity: Task) =
+            entity.also { saved.add(it) }.let { Unit.asSuccess() }
+        override suspend fun delete(entity: Task) = Unit.asSuccess()
+        override suspend fun findById(id: TaskId) = saved.find { it.id == id }.asSuccess()
+        override suspend fun findByStatus(completed: Boolean) =
+            saved.filter { it.completed == completed }.asSuccess()
     }
 
-    single<TaskDomainModule> {
-        TaskDomainModuleImpl(
-            deps = get(),
-            taskRepository = get(),
-        )
+    private val useCase = CreateTaskUseCase(
+        deps = fixedDeps,
+        taskRepository = fakeRepo,
+        titleValidator = notBlankValidator("title")
+            .andThen(maxLengthValidator("title", 200)),
+    )
+
+    @Test
+    fun `crea tarea con título válido`() = runTest {
+        val result = useCase(CreateTaskParams("Mi tarea"))
+
+        assertTrue(result.isSuccess)
+        assertEquals("test-id-1", result.getOrNull()!!.id.value)
+        assertEquals("Mi tarea", result.getOrNull()!!.title)
+        assertEquals(1, fakeRepo.saved.size)
     }
 
-    factory { get<TaskDomainModule>().createTask }
+    @Test
+    fun `falla con título en blanco`() = runTest {
+        val result = useCase(CreateTaskParams("   "))
+
+        assertTrue(result.isFailure)
+        val error = result.errorOrNull()
+        assertTrue(error is DomainError.Validation)
+        assertEquals("title", (error as DomainError.Validation).field)
+    }
 }
 ```
+
+**Principios de testing:**
+- `DomainDependencies` con valores fijos → determinismo total
+- Stubs manuales para repositories → sin framework de mocking
+- `runTest` de kotlinx-coroutines-test para use cases suspend
 
 ---
 
 ## FAQ
 
 **P: ¿El SDK depende de alguna librería Android?**
-No. El SDK es Kotlin `commonMain` puro. Compila a bytecode JVM en Android
-sin ninguna dependencia específica de Android.
+No. Es Kotlin `commonMain` puro. Compila a bytecode JVM sin dependencias Android.
 
-**P: ¿Puedo usar este SDK en un proyecto Compose Multiplatform?**
-Sí. El SDK no tiene dependencia de UI. Tu capa de Compose llama a los casos
-de uso exactamente como lo haría cualquier ViewModel.
+**P: ¿Puedo llamar `PureUseCase` desde el main thread?**
+Sí. `PureUseCase` es síncrono y puro — sin I/O, sin bloqueo. Seguro desde cualquier hilo.
 
-**P: ¿Qué pasa si mi repositorio lanza una excepción checked (ej. `SQLiteException`)?**
-Usa `runDomainCatching` en tu implementación de repositorio. Atrapa todos los
-throwables excepto cancelación y los mapea a `DomainError`. Las excepciones de
-cancelación siempre se re-lanzan para preservar la concurrencia estructurada.
+**P: ¿Debo usar `FlowUseCase` con `collectAsStateWithLifecycle()`?**
+Sí. `FlowUseCase` retorna `Flow<DomainResult<T>>`. Colecta con collectors lifecycle-aware.
 
-**P: ¿Debo envolver los `Flow` use cases en `collectAsStateWithLifecycle()`?**
-Sí. `FlowUseCase` retorna `Flow<DomainResult<T>>`. Colecta en tu ViewModel
-o UI de Compose usando los collectors lifecycle-aware estándar.
+**P: ¿Puedo tener múltiples `DomainDependencies`?**
+No. Crea una instancia al arranque y compártela entre todos los módulos. Es inmutable y thread-safe.
 
-**P: ¿Puedo llamar `PureUseCase` desde el hilo principal?**
-Sí. `PureUseCase` es síncrono y puro — sin I/O, sin bloqueo. Es
-explícitamente seguro para llamar desde cualquier hilo incluyendo el main thread.
+**P: ¿`runDomainCatching` atrapa `CancellationException`?**
+No. `CancellationException` siempre se re-lanza para preservar la concurrencia estructurada.
 
-**P: ¿Cómo manejo `DomainError.Unauthorized` en Android?**
-Mapéalo en tu ViewModel o en un error handler compartido para disparar el flujo
-de cierre de sesión o navegación a la pantalla de login:
-```kotlin
-.onFailure { error ->
-    if (error is DomainError.Unauthorized) {
-        navigator.navigateTo(LoginScreen)
-    }
-}
-```
+**P: ¿Necesito reglas ProGuard/R8?**
+No. El SDK no usa reflexión ni carga dinámica de clases.
 
-**P: ¿Qué hay de las reglas ProGuard/R8?**
-El SDK no usa reflexión, ni anotaciones de serialización, ni carga dinámica de
-clases. No se necesitan reglas de ProGuard.
+**P: ¿Cuál es la diferencia entre `Validator` y `DomainPolicy`?**
+`Validator` = restricciones sintácticas/estructurales (no blank, max length, range).
+`DomainPolicy` = reglas de negocio semánticas (puede requerir contexto de agregado o estado).
 
-**P: ¿Puedo tener múltiples instancias de `DomainDependencies`?**
-No. Crea una instancia al arranque de la app y compártela entre todos los feature
-modules. Es inmutable y segura para concurrencia.
+**P: ¿El SDK contiene implementaciones de Repository?**
+No. El SDK solo define contratos (interfaces). La capa de datos provee las implementaciones.
 
 ---
 
 <details>
 <summary><h2>🇺🇸 English Version</h2></summary>
 
-## Architecture on Android
-
-```mermaid
-graph TB
-    subgraph "Android App"
-        ACT["Activity / Fragment"]
-        VM["ViewModel"]
-        HILT["Hilt / Koin / Manual DI"]
-    end
-
-    subgraph "Domain SDK"
-        UC["SuspendUseCase"]
-        DEPS["DomainDependencies"]
-        MOD["FeatureDomainModule"]
-    end
-
-    subgraph "Data Layer"
-        ROOM["Room Database"]
-        KTOR["Ktor Client"]
-        REPOIMPL["RepositoryImpl"]
-    end
-
-    ACT --> VM
-    VM --> UC
-    HILT --> MOD
-    HILT --> DEPS
-    MOD --> UC
-    REPOIMPL --> ROOM
-    REPOIMPL --> KTOR
-
-    style UC fill:#4CAF50,color:#fff
-    style VM fill:#FF9800,color:#fff
-    style REPOIMPL fill:#2196F3,color:#fff
-```
+> This guide covers **exclusively the domain SDK** and how to use it in an Android project.
+> It does not cover data layer implementations (Room, Ktor, Retrofit) or UI (Compose, XML).
 
 ---
 
-## Step A1 — Gradle setup
-
-**Scenario:** Your Android app has a `:app` module and wants to use the SDK.
+## Step 1 — Gradle dependency
 
 ```kotlin
 // app/build.gradle.kts
@@ -341,222 +548,146 @@ dependencies {
 }
 ```
 
-## Step A2 — Platform providers
+The SDK is pure `commonMain`. No Android, Room, Ktor, or UI dependencies.
 
-**Scenario:** Provide Android-specific implementations for `ClockProvider` and `IdProvider`.
+---
+
+## Step 2 — SDK Contracts
+
+### Use Case types
+
+5 `fun interface` contracts:
+
+| Contract | Signature | When to use |
+|---|---|---|
+| `PureUseCase<I, O>` | `(I) → DomainResult<O>` | Synchronous, pure logic. No I/O. Safe from main thread |
+| `SuspendUseCase<I, O>` | `suspend (I) → DomainResult<O>` | Async single-result operations |
+| `FlowUseCase<I, O>` | `(I) → Flow<DomainResult<O>>` | Observe changes over time |
+| `NoParamsUseCase<O>` | `suspend () → DomainResult<O>` | No-params variant of SuspendUseCase |
+| `NoParamsFlowUseCase<O>` | `() → Flow<DomainResult<O>>` | No-params variant of FlowUseCase |
+
+### DomainResult
+
+Sealed type modeling success or failure **without exceptions**:
 
 ```kotlin
-// data module — AndroidProviders.kt
-import com.domain.core.provider.ClockProvider
-import com.domain.core.provider.IdProvider
-import java.util.UUID
-
-val androidClock: ClockProvider = ClockProvider {
-    System.currentTimeMillis()
-}
-
-val androidIdProvider: IdProvider = IdProvider {
-    UUID.randomUUID().toString()
+sealed class DomainResult<out T> {
+    data class Success<out T>(val value: T) : DomainResult<T>()
+    data class Failure(val error: DomainError) : DomainResult<Nothing>()
 }
 ```
 
-## Step A3 — Room repository implementation
+Operators: `map`, `flatMap`, `mapError`, `onSuccess`, `onFailure`, `getOrNull`, `getOrElse`, `zip`, `runDomainCatching`.
 
-**Scenario:** Implement `TaskRepository` backed by Room.
+### DomainError
+
+Sealed hierarchy with 6 subtypes: `Validation`, `NotFound`, `Unauthorized`, `Conflict`, `Infrastructure`, `Unknown`.
+
+### Domain Model
+
+- `Entity<ID>` — identity-based objects
+- `ValueObject` — immutable, structural equality
+- `AggregateRoot<ID>` — consistency boundary, repositories operate on these
+
+### Repository & Gateway contracts
+
+Repositories: `ReadRepository<ID, T>`, `ReadCollectionRepository<T>`, `WriteRepository<T>`.
+Gateways: `SuspendGateway<I, O>`, `CommandGateway<I>`.
+
+The SDK defines interfaces only. The data layer provides implementations.
+
+### Validators
+
+`Validator<T>` with built-in primitives: `notBlankValidator`, `maxLengthValidator`, `minLengthValidator`, `rangeValidator`.
+Compose with `andThen` (fail-fast) or `collectValidationErrors` (accumulate all).
+
+### Domain Policies
+
+`DomainPolicy<C>` for semantic business rules. `SuspendDomainPolicy<C>` for async rules.
+Combinators: `and`, `or`, `negate`.
+
+### Providers & DomainDependencies
+
+`ClockProvider` (epoch ms) and `IdProvider` (unique string), grouped in immutable `DomainDependencies`.
+
+---
+
+## Step 3 — Implement a Use Case
 
 ```kotlin
-// data module — TaskRepositoryImpl.kt
-class TaskRepositoryImpl(
-    private val dao: TaskDao,
-) : TaskRepository {
+class CreateTaskUseCase(
+    private val deps: DomainDependencies,
+    private val taskRepository: TaskRepository,
+    private val titleValidator: Validator<String>,
+) : SuspendUseCase<CreateTaskParams, Task> {
 
-    override suspend fun findById(id: TaskId): DomainResult<Task?> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "DB read failed", cause = it) }
-        ) {
-            dao.findById(id.value)?.toDomain()
+    override suspend fun invoke(params: CreateTaskParams): DomainResult<Task> {
+        titleValidator.validate(params.title).let { result ->
+            if (result.isFailure) return result as DomainResult.Failure
         }
-
-    override suspend fun save(entity: Task): DomainResult<Unit> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "DB write failed", cause = it) }
-        ) {
-            dao.insertOrReplace(entity.toEntity())
-        }
-
-    override suspend fun delete(entity: Task): DomainResult<Unit> =
-        runDomainCatching(
-            errorMapper = { DomainError.Infrastructure(detail = "DB delete failed", cause = it) }
-        ) {
-            dao.delete(entity.id.value)
-        }
+        val task = Task(
+            id = TaskId(deps.idProvider.next()),
+            title = params.title.trim(),
+            completed = false,
+            createdAt = deps.clock.nowMillis(),
+        )
+        return taskRepository.save(task).map { task }
+    }
 }
 ```
 
-## Step A4 — ViewModel integration
+---
 
-**Scenario:** A ViewModel calls a use case and maps the result to UI state.
+## Step 4 — Inject Use Cases into the ViewModel
+
+The ViewModel receives **only SDK contracts**, never concrete implementations:
 
 ```kotlin
 class TaskViewModel(
     private val createTask: SuspendUseCase<CreateTaskParams, Task>,
+    private val observeTasks: NoParamsFlowUseCase<List<Task>>,
 ) : ViewModel() {
-
-    private val _uiState = MutableStateFlow<TaskUiState>(TaskUiState.Idle)
-    val uiState: StateFlow<TaskUiState> = _uiState.asStateFlow()
 
     fun onCreateTask(title: String) {
         viewModelScope.launch {
-            _uiState.value = TaskUiState.Loading
-
             createTask(CreateTaskParams(title))
-                .onSuccess { task ->
-                    _uiState.value = TaskUiState.Success(task)
-                }
+                .onSuccess { /* update UI state */ }
                 .onFailure { error ->
-                    _uiState.value = when (error) {
-                        is DomainError.Validation ->
-                            TaskUiState.ValidationError(error.field, error.detail)
-                        is DomainError.Infrastructure ->
-                            TaskUiState.Error("Something went wrong. Please try again.")
-                        else ->
-                            TaskUiState.Error(error.message)
+                    when (error) {
+                        is DomainError.Validation -> /* show field error */
+                        else -> /* show generic error */
                     }
                 }
         }
     }
 }
-
-sealed interface TaskUiState {
-    data object Idle : TaskUiState
-    data object Loading : TaskUiState
-    data class Success(val task: Task) : TaskUiState
-    data class ValidationError(val field: String, val detail: String) : TaskUiState
-    data class Error(val message: String) : TaskUiState
-}
 ```
 
-## Step A5 — Manual wiring (no DI framework)
+---
 
-**Scenario:** Wire everything without Koin or Hilt.
+## Step 5 — Testing
 
 ```kotlin
-// AppModule.kt — create once at Application.onCreate()
-class AppModule(context: Context) {
-
-    private val database = Room.databaseBuilder(
-        context, AppDatabase::class.java, "app.db"
-    ).build()
-
-    private val domainDeps = DomainDependencies(
-        clock = androidClock,
-        idProvider = androidIdProvider,
-    )
-
-    private val taskRepository: TaskRepository = TaskRepositoryImpl(database.taskDao())
-
-    val taskModule: TaskDomainModule = TaskDomainModuleImpl(
-        deps = domainDeps,
-        taskRepository = taskRepository,
-    )
-}
-
-// In your Activity or Fragment:
-val appModule = (application as MyApp).appModule
-val viewModel = TaskViewModel(createTask = appModule.taskModule.createTask)
+private val fixedDeps = DomainDependencies(
+    clock = ClockProvider { 1_700_000_000_000L },
+    idProvider = IdProvider { "test-id-1" },
+)
+// Manual stubs — no mocking framework needed
 ```
 
-## Step A6 — Wiring with Hilt (optional)
-
-**Scenario:** You prefer Hilt for DI on Android.
-
-```kotlin
-@Module
-@InstallIn(SingletonComponent::class)
-object DomainModule {
-
-    @Provides @Singleton
-    fun provideDomainDeps(): DomainDependencies = DomainDependencies(
-        clock = androidClock,
-        idProvider = androidIdProvider,
-    )
-
-    @Provides @Singleton
-    fun provideTaskModule(
-        deps: DomainDependencies,
-        taskRepository: TaskRepository,
-    ): TaskDomainModule = TaskDomainModuleImpl(deps, taskRepository)
-
-    @Provides
-    fun provideCreateTask(module: TaskDomainModule): SuspendUseCase<CreateTaskParams, Task> =
-        module.createTask
-}
-```
-
-## Step A7 — Wiring with Koin (optional)
-
-**Scenario:** You prefer Koin for DI on Android.
-
-```kotlin
-val domainModule = module {
-    single {
-        DomainDependencies(
-            clock = androidClock,
-            idProvider = androidIdProvider,
-        )
-    }
-
-    single<TaskDomainModule> {
-        TaskDomainModuleImpl(
-            deps = get(),
-            taskRepository = get(),
-        )
-    }
-
-    factory { get<TaskDomainModule>().createTask }
-}
-```
+---
 
 ## FAQ
 
-**Q: Does the SDK depend on any Android library?**
-No. The SDK is pure `commonMain` Kotlin. It compiles to JVM bytecode on Android
-without any Android-specific dependency.
+**Q: Does the SDK depend on any Android library?** No. Pure `commonMain` Kotlin.
 
-**Q: Can I use this SDK in a Compose Multiplatform project?**
-Yes. The SDK has no UI dependency. Your Compose layer calls use cases exactly
-like any ViewModel would.
+**Q: Can I call `PureUseCase` from the main thread?** Yes. Synchronous, pure, no I/O.
 
-**Q: What if my repository throws a checked exception (e.g., `SQLiteException`)?**
-Use `runDomainCatching` in your repository implementation. It catches all
-non-cancellation throwables and maps them to `DomainError`. Cancellation
-exceptions are always rethrown to preserve structured concurrency.
+**Q: Does `runDomainCatching` catch `CancellationException`?** No. Always rethrown.
 
-**Q: Should I wrap `Flow` use cases in `collectAsStateWithLifecycle()`?**
-Yes. `FlowUseCase` returns `Flow<DomainResult<T>>`. Collect it in your ViewModel
-or Compose UI using the standard lifecycle-aware collectors.
+**Q: Does the SDK contain Repository implementations?** No. Only contracts (interfaces).
 
-**Q: Can I call `PureUseCase` from the UI thread?**
-Yes. `PureUseCase` is synchronous and pure — no I/O, no blocking. It is
-explicitly safe to call from any thread including the main thread.
-
-**Q: How do I handle `DomainError.Unauthorized` on Android?**
-Map it in your ViewModel or a shared error handler to trigger a sign-out flow
-or navigation to the login screen:
-```kotlin
-.onFailure { error ->
-    if (error is DomainError.Unauthorized) {
-        navigator.navigateTo(LoginScreen)
-    }
-}
-```
-
-**Q: What about ProGuard/R8 rules?**
-The SDK uses no reflection, no serialization annotations, and no dynamic class
-loading. No ProGuard rules are needed.
-
-**Q: Can I have multiple `DomainDependencies` instances?**
-No. Create one instance at app startup and share it across all feature modules.
-It is immutable and concurrency-safe.
+**Q: What's the difference between `Validator` and `DomainPolicy`?**
+Validator = syntactic constraints. DomainPolicy = semantic business rules.
 
 </details>

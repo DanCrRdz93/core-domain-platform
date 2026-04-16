@@ -435,8 +435,9 @@ class CreateTaskUseCaseTest {
 
 > **Guía completa:** [GUIDE_ANDROID.md](GUIDE_ANDROID.md)
 
-Cubre 7 pasos: Gradle setup → Providers de plataforma → Room repository →
-ViewModel integration → Wiring manual → Hilt → Koin, más FAQ con 8 preguntas frecuentes.
+Documenta en detalle todos los contratos del SDK (Use Cases, DomainResult, DomainError,
+Model, Repository, Gateway, Validators, Policies, Providers) y cómo inyectar los
+casos de uso en tu ViewModel. Incluye ejemplos de implementación, validación, testing y FAQ.
 
 ---
 
@@ -444,8 +445,9 @@ ViewModel integration → Wiring manual → Hilt → Koin, más FAQ con 8 pregun
 
 > **Guía completa:** [GUIDE_IOS.md](GUIDE_IOS.md)
 
-Cubre 7 pasos: Framework export → Providers de plataforma → Module factory →
-SQLDelight repository → Swift ViewModel → SwiftUI View → App wiring, más FAQ con 8 preguntas frecuentes.
+Documenta todos los contratos del SDK, cómo se exponen los tipos Kotlin en Swift
+(tabla de mapeo Kotlin→Swift), cómo cablear DomainDependencies para iOS, y cómo
+inyectar los casos de uso en el ViewModel Swift. Incluye ejemplos, testing y FAQ.
 
 ---
 
@@ -972,8 +974,9 @@ class CreateTaskUseCaseTest {
 
 > **Full guide:** [GUIDE_ANDROID.md](GUIDE_ANDROID.md)
 
-Covers 7 steps: Gradle setup → Platform providers → Room repository →
-ViewModel integration → Manual wiring → Hilt → Koin, plus FAQ with 8 questions.
+Documents all SDK contracts (Use Cases, DomainResult, DomainError, Model, Repository,
+Gateway, Validators, Policies, Providers) and how to inject use cases into your ViewModel.
+Includes implementation examples, validation, testing, and FAQ.
 
 ---
 
@@ -981,8 +984,9 @@ ViewModel integration → Manual wiring → Hilt → Koin, plus FAQ with 8 quest
 
 > **Full guide:** [GUIDE_IOS.md](GUIDE_IOS.md)
 
-Covers 7 steps: Framework export → Platform providers → Module factory →
-SQLDelight repository → Swift ViewModel → SwiftUI View → App wiring, plus FAQ with 8 questions.
+Documents all SDK contracts, how Kotlin types are exposed in Swift (Kotlin→Swift
+mapping table), how to wire DomainDependencies for iOS, and how to inject use cases
+into the Swift ViewModel. Includes examples, testing, and FAQ.
 
 ---
 
