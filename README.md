@@ -1,5 +1,6 @@
 # Core Domain Platform SDK
 
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
 ![Maven Central](https://img.shields.io/maven-central/v/io.github.dancrrdz93/coredomainplatform)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.1.20-purple)
 ![Platform](https://img.shields.io/badge/platform-JVM%20%7C%20Android%20%7C%20iOS-green)
