@@ -52,6 +52,10 @@ public sealed class DomainError(public val message: String) {
      * A downstream dependency (repository, gateway) failed in a way that
      * the domain cannot recover from. Wraps infrastructure errors without
      * exposing infrastructure types.
+     *
+     * [cause] is `Throwable?` by design. When bridging from the data SDK,
+     * pass `diagnostic?.cause` (the underlying exception), NOT the
+     * `NetworkError` itself — `NetworkError` is not a `Throwable`.
      */
     public data class Infrastructure(
         val detail: String,
@@ -59,8 +63,26 @@ public sealed class DomainError(public val message: String) {
     ) : DomainError(message = detail)
 
     /**
+     * The operation was cancelled — typically because the user navigated away,
+     * the coroutine scope was cancelled, or a timeout policy triggered.
+     *
+     * Design rationale:
+     * - Cancellation is **intentional**, not a failure. Mapping it as
+     *   [Infrastructure] would misrepresent user-initiated or lifecycle-driven
+     *   cancellations as infrastructure failures.
+     * - This maps directly from `NetworkError.Cancelled` in the data SDK.
+     * - Consumers should typically treat this as a no-op (suppress the error
+     *   in the UI) rather than showing an error dialog.
+     */
+    public data class Cancelled(
+        val detail: String = "Operation was cancelled.",
+    ) : DomainError(message = detail)
+
+    /**
      * A catch-all for unexpected domain conditions not covered above.
      * Usage should be rare; prefer a specific subclass.
+     *
+     * [cause] is `Throwable?` — same contract as [Infrastructure].
      */
     public data class Unknown(
         val detail: String = "An unexpected error occurred.",

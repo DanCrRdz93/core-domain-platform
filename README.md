@@ -636,54 +636,98 @@ El **Core Domain Platform** (este SDK) define los contratos del dominio. El **[C
 ### Arquitectura completa
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        TU APP (Android/iOS)                      │
-│                                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                      │
-│  │Feature A │  │Feature B │  │Feature C │  ← ViewModels         │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘                      │
-│       │              │              │                            │
-│  ┌────▼──────────────▼──────────────▼────┐                      │
-│  │     Domain Use Cases (este SDK)       │                      │
-│  │  PureUseCase · SuspendUseCase · Flow  │                      │
-│  └────┬──────────────┬──────────────┬────┘                      │
-│       │              │              │                            │
-│  ┌────▼──────────────▼──────────────▼────┐                      │
-│  │   Repository / Gateway Implementations│  ← TÚ LOS ESCRIBES  │
-│  │   (puente entre ambos SDKs)           │                      │
-│  └────┬──────────────┬──────────────┬────┘                      │
-│       │              │              │                            │
-│  ┌────▼────┐  ┌──────▼─────┐  ┌────▼──────────┐                │
-│  │network  │  │ network    │  │  security     │  ← Data SDK    │
-│  │ -core   │  │  -ktor     │  │   -core       │                │
-│  └─────────┘  └────────────┘  └───────────────┘                │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          TU APP (Android/iOS)                           │
+│                                                                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                              │
+│  │Feature A │  │Feature B │  │Feature C │  ← ViewModels                 │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                              │
+│       │              │              │                                    │
+│  ┌────▼──────────────▼──────────────▼────────────────┐                  │
+│  │     Domain Use Cases (este SDK)                   │                  │
+│  │  PureUseCase · SuspendUseCase · FlowUseCase       │                  │
+│  │  (genera operationId, decide retryPolicyOverride)  │                  │
+│  └────┬──────────────┬──────────────┬────────────────┘                  │
+│       │              │              │                                    │
+│  ┌────▼──────────────▼──────────────▼────────────────┐                  │
+│  │   Repository / Gateway Implementations            │  ← TÚ LOS       │
+│  │   (puente entre ambos SDKs)                       │    ESCRIBES      │
+│  │   Propaga: RequestContext, ResultMetadata          │                  │
+│  └────┬──────────────┬──────────┬────────────────────┘                  │
+│       │              │          │                                        │
+│  ┌────▼────┐  ┌──────▼────┐  ┌─▼───────────────────────────────────┐   │
+│  │network  │  │ network   │  │  security-core                      │   │
+│  │ -core   │  │  -ktor    │  │  SessionController · CredentialProv │   │
+│  │         │  │           │  │  SecretStore · TrustPolicy          │   │
+│  └─────────┘  └───────────┘  └─────────────────────────────────────┘   │
+│                 ↑ Data SDK                                              │
+│  Observability: LoggingObserver · MetricsObserver · TracingObserver     │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 1. Mapeo de errores: `NetworkError` → `DomainError`
 
+> **Nota:** `NetworkError` **no** es `Throwable`. Cada subtipo tiene `diagnostic: Diagnostic?`
+> donde `Diagnostic.cause: Throwable?` contiene la excepción original. El mapeo debe pasar
+> `diagnostic?.cause` a `DomainError.Infrastructure.cause`, no el `NetworkError` en sí.
+
 ```kotlin
 // Extensión que vive en tu capa de datos (NO en ninguno de los dos SDKs)
 fun NetworkError.toDomainError(): DomainError = when (this) {
-    is NetworkError.Connectivity -> DomainError.Infrastructure("Sin conexión a internet", this)
-    is NetworkError.Timeout      -> DomainError.Infrastructure("Tiempo de espera agotado", this)
+    // ── Transporte ──
+    is NetworkError.Connectivity -> DomainError.Infrastructure(
+        detail = "Sin conexión a internet",
+        cause = diagnostic?.cause,     // ← Throwable? del Data SDK
+    )
+    is NetworkError.Timeout -> DomainError.Infrastructure(
+        detail = "Tiempo de espera agotado",
+        cause = diagnostic?.cause,
+    )
+    is NetworkError.Cancelled -> DomainError.Cancelled(
+        detail = "Solicitud cancelada",  // ← Intencional, no falla de infra
+    )
+
+    // ── HTTP semántico ──
     is NetworkError.Authentication -> DomainError.Unauthorized("Autenticación requerida")
     is NetworkError.Authorization  -> DomainError.Unauthorized("Acceso denegado")
     is NetworkError.ClientError -> when (statusCode) {
-        404 -> DomainError.NotFound("Recurso", diagnostic?.detail ?: "")
-        409 -> DomainError.Conflict(message)
-        422 -> DomainError.Validation("request", message)
-        else -> DomainError.Infrastructure("Error HTTP $statusCode", this)
+        404  -> DomainError.NotFound("Recurso", diagnostic?.description ?: "")
+        409  -> DomainError.Conflict(message)
+        422  -> DomainError.Validation("request", diagnostic?.description ?: message)
+        else -> DomainError.Infrastructure("Error HTTP $statusCode", diagnostic?.cause)
     }
-    is NetworkError.ServerError    -> DomainError.Infrastructure("Error del servidor ($statusCode)", this)
-    is NetworkError.Serialization  -> DomainError.Infrastructure("Error al procesar respuesta", this)
-    is NetworkError.ResponseValidation -> DomainError.Infrastructure(reason, this)
-    is NetworkError.Cancelled      -> DomainError.Infrastructure("Solicitud cancelada", this)
-    is NetworkError.Unknown        -> DomainError.Unknown(message, this)
+    is NetworkError.ServerError -> DomainError.Infrastructure(
+        detail = "Error del servidor ($statusCode)",
+        cause = diagnostic?.cause,
+    )
+
+    // ── Procesamiento de datos ──
+    is NetworkError.Serialization -> DomainError.Infrastructure(
+        detail = "Error al procesar respuesta",
+        cause = diagnostic?.cause,
+    )
+    is NetworkError.ResponseValidation -> DomainError.Infrastructure(
+        detail = reason,
+        cause = diagnostic?.cause,
+    )
+
+    // ── Catch-all ──
+    is NetworkError.Unknown -> DomainError.Unknown(
+        detail = message,
+        cause = diagnostic?.cause,
+    )
 }
 ```
 
+**¿Por qué `Cancelled` no es `Infrastructure`?** Una cancelación es intencional (el usuario
+navegó fuera, el scope de coroutine se canceló). Mapearla como `Infrastructure` la haría
+indistinguible de una caída de servidor en el `when` del ViewModel. Con `DomainError.Cancelled`
+el consumidor puede suprimirla sin mostrar diálogo de error.
+
 ### 2. Implementación de un Repository (el puente)
+
+> **Escenario:** Un use case necesita obtener un usuario por ID. El DataSource del Data SDK
+> retorna `NetworkResult<UserDto>`. El repository convierte DTO → modelo y error → DomainError.
 
 ```kotlin
 class UserRepositoryImpl(
@@ -701,49 +745,402 @@ class UserRepositoryImpl(
 }
 ```
 
-### 3. Adaptador de sesión: `SessionController` → `NoParamsFlowGateway`
+### 3. Propagación de `ResponseMetadata` al dominio
+
+> **Escenario:** Un equipo de soporte necesita que el ViewModel muestre el `requestId`
+> cuando una operación falla, para que el usuario pueda reportarlo. También se quiere
+> medir la latencia percibida (`durationMs`) y cuántos reintentos se hicieron (`attemptCount`).
 
 ```kotlin
-class SessionStateGateway(
-    private val sessionController: SessionController,   // ← Data SDK
-) : NoParamsFlowGateway<Boolean> {                      // ← Domain SDK contrato
+class UserRepositoryWithMeta(
+    private val dataSource: UserRemoteDataSource,
+    private val mapper: Mapper<UserDto, User>,
+) : ReadRepository<UserId, User> {
 
-    override fun observe(): Flow<DomainResult<Boolean>> =
-        sessionController.state.map { state ->
-            (state is SessionState.Active).asSuccess()
+    // Retorna DomainResultWithMeta para que el ViewModel acceda a metadata
+    suspend fun findByIdWithMeta(id: UserId): DomainResultWithMeta<User?> {
+        val networkResult = dataSource.getUser(id.value)
+        return when (networkResult) {
+            is NetworkResult.Success -> DomainResultWithMeta(
+                result = mapper.map(networkResult.data).asSuccess(),
+                metadata = networkResult.metadata.toDomainMeta(),
+            )
+            is NetworkResult.Failure -> DomainResultWithMeta(
+                result = domainFailure(networkResult.error.toDomainError()),
+                // En failure también puedes propagar metadata si la tienes
+            )
         }
+    }
+
+    // Contrato estándar (sin metadata) sigue disponible
+    override suspend fun findById(id: UserId): DomainResult<User?> =
+        findByIdWithMeta(id).result
+}
+
+// Extensión en tu capa de datos
+fun ResponseMetadata.toDomainMeta(): ResultMetadata = ResultMetadata(
+    requestId = requestId,
+    durationMs = durationMs,
+    attemptCount = attemptCount,
+    extra = buildMap {
+        headers["X-RateLimit-Remaining"]?.firstOrNull()?.let { put("rateLimitRemaining", it) }
+        headers["ETag"]?.firstOrNull()?.let { put("etag", it) }
+    },
+)
+```
+
+**Uso en el ViewModel:**
+
+```kotlin
+val (result, meta) = userRepo.findByIdWithMeta(userId)
+result.fold(
+    onSuccess = { user -> showUser(user) },
+    onFailure = { error ->
+        showError(error.message)
+        // El usuario puede reportar el requestId al soporte
+        analytics.logError(requestId = meta.requestId, duration = meta.durationMs)
+    },
+)
+```
+
+### 4. `RequestContext` — correlación dominio → HTTP
+
+> **Escenario:** El equipo de SRE quiere ver en Datadog qué use case generó cada request HTTP.
+> `PlaceOrderUseCase` genera un `operationId = "place-order"` que viaja hasta los headers HTTP
+> para correlacionar la operación de dominio con la traza de infraestructura.
+
+```kotlin
+// ── Contrato en tu capa de dominio (interface del repository) ──
+interface OrderRepository : WriteRepository<Order> {
+    suspend fun placeOrder(order: Order, operationId: String): DomainResult<Unit>
+}
+
+// ── Implementación en tu capa de datos (puente) ──
+class OrderRepositoryImpl(
+    private val dataSource: OrderRemoteDataSource,
+) : OrderRepository {
+
+    override suspend fun placeOrder(order: Order, operationId: String): DomainResult<Unit> {
+        val context = RequestContext(
+            operationId = operationId,              // ← Viene del use case
+            tags = mapOf("orderId" to order.id),    // ← Contexto de negocio
+            requiresAuth = true,
+        )
+        val result = dataSource.createOrder(order.toDto(), context)
+        return result.fold(
+            onSuccess = { Unit.asSuccess() },
+            onFailure = { error -> domainFailure(error.toDomainError()) },
+        )
+    }
+
+    // save/delete estándar para WriteRepository
+    override suspend fun save(entity: Order) = placeOrder(entity, "save-order")
+    override suspend fun delete(entity: Order): DomainResult<Unit> { /* ... */ }
+}
+
+// ── Use case genera el operationId ──
+class PlaceOrderUseCase(
+    private val orderRepo: OrderRepository,
+    private val deps: DomainDependencies,
+) : SuspendUseCase<PlaceOrderInput, Unit> {
+
+    override suspend fun invoke(input: PlaceOrderInput): DomainResult<Unit> {
+        val order = Order(id = deps.idProvider.generate(), /* ... */)
+        return orderRepo.placeOrder(order, operationId = "place-order")
+    }
 }
 ```
 
-### 4. Wiring completo en la app
+En Datadog verás: `operation_id=place-order, orderId=abc-123` vinculado al request HTTP.
+
+### 5. `RetryPolicy` override desde el dominio
+
+> **Escenario:** Un pago NO debe reintentarse — reintentar podría cobrar dos veces al usuario.
+> El use case indica al repository que esta operación es `RetryPolicy.None`.
 
 ```kotlin
-// Application.onCreate o AppDelegate — punto de ensamblaje
-fun provideAppDependencies(): AppDependencies {
-    // ── Domain SDK ──
-    val domainDeps = DomainDependencies(
-        clock = ClockProvider { System.currentTimeMillis() },
-        idProvider = IdProvider { UUID.randomUUID().toString() },
+// ── Contrato del repository (dominio) ──
+interface PaymentRepository : Repository {
+    suspend fun processPayment(payment: Payment, allowRetry: Boolean = false): DomainResult<PaymentResult>
+}
+
+// ── Implementación (puente) ──
+class PaymentRepositoryImpl(
+    private val dataSource: PaymentRemoteDataSource,
+) : PaymentRepository {
+
+    override suspend fun processPayment(
+        payment: Payment,
+        allowRetry: Boolean,
+    ): DomainResult<PaymentResult> {
+        val context = RequestContext(
+            operationId = "process-payment",
+            // Si el dominio dice no reintentar, override la policy
+            retryPolicyOverride = if (!allowRetry) RetryPolicy.None else null,
+            requiresAuth = true,
+        )
+        val result = dataSource.charge(payment.toDto(), context)
+        return result.fold(
+            onSuccess = { dto -> PaymentResult(dto.transactionId).asSuccess() },
+            onFailure = { error -> domainFailure(error.toDomainError()) },
+        )
+    }
+}
+
+// ── Use case ──
+class ProcessPaymentUseCase(
+    private val paymentRepo: PaymentRepository,
+) : SuspendUseCase<Payment, PaymentResult> {
+
+    override suspend fun invoke(input: Payment): DomainResult<PaymentResult> =
+        paymentRepo.processPayment(input, allowRetry = false) // ← NUNCA reintentar pagos
+}
+```
+
+### 6. Ciclo de vida completo de sesión
+
+> **Escenario:** La app necesita: login, logout, force-logout por 401, refresh de token,
+> y observar eventos de sesión (para analytics y para actualizar la UI).
+
+```kotlin
+// ── Adapter: login ──
+class LoginGateway(
+    private val session: SessionController,
+) : CommandGateway<SessionCredentials> {
+
+    override suspend fun dispatch(input: SessionCredentials): DomainResult<Unit> =
+        runDomainCatching { session.startSession(input) }
+}
+
+// ── Adapter: logout voluntario ──
+class LogoutGateway(
+    private val session: SessionController,
+) : CommandGateway<Unit> {
+
+    override suspend fun dispatch(input: Unit): DomainResult<Unit> =
+        runDomainCatching { session.endSession() }
+}
+
+// ── Adapter: force-logout (401 o seguridad comprometida) ──
+class ForceLogoutGateway(
+    private val session: SessionController,
+) : CommandGateway<Unit> {
+
+    override suspend fun dispatch(input: Unit): DomainResult<Unit> =
+        runDomainCatching { session.invalidate() }
+}
+
+// ── Adapter: refresh de token ──
+// RefreshOutcome es un sealed del Data SDK: Refreshed, NotNeeded, Failed
+class RefreshSessionGateway(
+    private val session: SessionController,
+) : SuspendGateway<Unit, RefreshOutcome> {
+
+    override suspend fun execute(input: Unit): DomainResult<RefreshOutcome> =
+        runDomainCatching { session.refreshSession() }
+}
+
+// ── Adapter: estado de sesión (StateFlow → FlowGateway) ──
+class SessionStateGateway(
+    private val session: SessionController,
+) : NoParamsFlowGateway<Boolean> {
+
+    override fun observe(): Flow<DomainResult<Boolean>> =
+        session.state.map { state ->
+            (state is SessionState.Active).asSuccess()
+        }
+}
+
+// ── Adapter: eventos de sesión para analytics ──
+class SessionEventsGateway(
+    private val session: SessionController,
+) : NoParamsFlowGateway<SessionEvent> {
+
+    override fun observe(): Flow<DomainResult<SessionEvent>> =
+        session.events.map { event -> event.asSuccess() }
+}
+```
+
+**Uso en un use case:**
+
+```kotlin
+class LogoutUseCase(
+    private val logout: LogoutGateway,
+    private val clearCache: ClearCacheGateway, // otro gateway tuyo
+) : SuspendUseCase<Unit, Unit> {
+
+    override suspend fun invoke(input: Unit): DomainResult<Unit> =
+        logout.dispatch(Unit).flatMap { clearCache.dispatch(Unit) }
+}
+```
+
+### 7. Múltiples APIs con diferentes configuraciones
+
+> **Escenario:** `PlaceOrderUseCase` orquesta 3 APIs (orders, inventory, payments) cada una
+> con su propio `NetworkConfig`, executor y URL base.
+
+```kotlin
+fun provideMultiApiDependencies(): AppDependencies {
+    // ── Configuraciones por API ──
+    val ordersConfig = NetworkConfig(
+        baseUrl = "https://orders.api.example.com",
+        connectTimeout = 10_000L,
+        retryPolicy = RetryPolicy.ExponentialBackoff(maxRetries = 3),
+    )
+    val inventoryConfig = NetworkConfig(
+        baseUrl = "https://inventory.api.example.com",
+        connectTimeout = 5_000L,
+        retryPolicy = RetryPolicy.FixedDelay(maxRetries = 2, delay = 1_000L),
+    )
+    val paymentsConfig = NetworkConfig(
+        baseUrl = "https://payments.api.example.com",
+        connectTimeout = 30_000L,
+        retryPolicy = RetryPolicy.None, // ← Pagos: NUNCA reintentar por defecto
     )
 
-    // ── Data SDK ──
-    val networkConfig = NetworkConfig(baseUrl = "https://api.example.com")
-    val httpEngine = KtorHttpEngine(networkConfig)
-    val executor = SafeRequestExecutor(httpEngine, retryPolicy, observer)
+    // ── Executors independientes por API ──
+    val ordersExecutor = DefaultSafeRequestExecutor(
+        engine = KtorHttpEngine.create(ordersConfig),
+        config = ordersConfig,
+        classifier = KtorErrorClassifier(),
+        observers = listOf(loggingObserver, metricsObserver),
+    )
+    val inventoryExecutor = DefaultSafeRequestExecutor(
+        engine = KtorHttpEngine.create(inventoryConfig),
+        config = inventoryConfig,
+        classifier = KtorErrorClassifier(),
+    )
+    val paymentsExecutor = DefaultSafeRequestExecutor(
+        engine = KtorHttpEngine.create(paymentsConfig, bankTrustPolicy), // ← Gap 9: TrustPolicy
+        config = paymentsConfig,
+        classifier = KtorErrorClassifier(),
+    )
 
-    // ── Puente: DataSources + Repositories ──
-    val userDataSource = UserRemoteDataSource(executor)
-    val userMapper = Mapper<UserDto, User> { dto ->
-        User(id = UserId(dto.id), name = dto.displayName, email = dto.email)
-    }
-    val userRepo = UserRepositoryImpl(userDataSource, userMapper)
+    // ── DataSources ──
+    val orderDataSource = OrderRemoteDataSource(ordersExecutor)
+    val inventoryDataSource = InventoryRemoteDataSource(inventoryExecutor)
+    val paymentDataSource = PaymentRemoteDataSource(paymentsExecutor)
 
-    // ── Use Cases (Domain SDK) ──
-    val getUser = GetUserUseCase(userRepo)
-    val createUser = CreateUserUseCase(domainDeps, userRepo, nameValidator)
+    // ── Repositories (puente) ──
+    val orderRepo = OrderRepositoryImpl(orderDataSource)
+    val inventoryGateway = InventoryGatewayImpl(inventoryDataSource)
+    val paymentRepo = PaymentRepositoryImpl(paymentDataSource)
 
-    return AppDependencies(getUser, createUser, /* ... */)
+    // ── Use case orquesta las 3 APIs ──
+    val placeOrder = PlaceOrderUseCase(orderRepo, inventoryGateway, paymentRepo, domainDeps)
+
+    return AppDependencies(placeOrder, /* ... */)
 }
+```
+
+### 8. Exposición de Rate Limits al dominio
+
+> **Escenario:** La API retorna `X-RateLimit-Remaining` en headers. El dominio necesita
+> un gateway que exponga el rate limit actual para decidir si hacer throttling preventivo
+> (ej., deshabilitar el botón "Actualizar" si quedan pocas solicitudes).
+
+```kotlin
+// ── Gateway reactivo (dominio) ──
+interface RateLimitGateway : NoParamsFlowGateway<Int> // Remaining count
+
+// ── Implementación (puente) — usa ResponseInterceptor del Data SDK ──
+class RateLimitGatewayImpl : RateLimitGateway, ResponseInterceptor {
+    private val _remaining = MutableStateFlow(Int.MAX_VALUE)
+
+    // ResponseInterceptor del Data SDK — intercepta cada respuesta HTTP
+    override suspend fun intercept(response: InterceptedResponse): InterceptedResponse {
+        response.headers["X-RateLimit-Remaining"]?.firstOrNull()?.toIntOrNull()?.let {
+            _remaining.value = it
+        }
+        return response
+    }
+
+    // NoParamsFlowGateway del Domain SDK — expone al dominio
+    override fun observe(): Flow<DomainResult<Int>> =
+        _remaining.map { it.asSuccess() }
+}
+
+// Registrar como ResponseInterceptor al crear el executor:
+val rateLimitGateway = RateLimitGatewayImpl()
+val executor = DefaultSafeRequestExecutor(
+    engine = engine,
+    config = config,
+    classifier = KtorErrorClassifier(),
+    responseInterceptors = listOf(rateLimitGateway), // ← doble rol
+)
+```
+
+### 9. `TrustPolicy` y Certificate Pinning en el wiring
+
+> **Escenario:** Una app de banca necesita protección contra ataques MITM.
+> El Data SDK soporta `TrustPolicy` con `CertificatePin` que valida los
+> certificados del servidor contra pins conocidos.
+
+```kotlin
+// ── TrustPolicy para banca / salud ──
+val bankTrustPolicy = DefaultTrustPolicy(
+    pins = listOf(
+        CertificatePin(
+            hostname = "payments.api.example.com",
+            sha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", // SHA-256 del cert
+        ),
+        CertificatePin(
+            hostname = "payments.api.example.com",
+            sha256 = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=", // Backup pin
+        ),
+    ),
+)
+
+// Pasar al crear el engine
+val secureEngine = KtorHttpEngine.create(
+    config = paymentsConfig,
+    trustPolicy = bankTrustPolicy,    // ← Pinning activo
+)
+val secureExecutor = DefaultSafeRequestExecutor(
+    engine = secureEngine,
+    config = paymentsConfig,
+    classifier = KtorErrorClassifier(),
+)
+```
+
+### 10. Observers en el wiring
+
+> **Escenario:** Necesitas logging de requests HTTP en desarrollo, métricas de latencia
+> en producción, y un observer custom que reporte errores a Crashlytics.
+
+```kotlin
+// ── LoggingObserver (Data SDK) — solo en debug ──
+val loggingObserver = LoggingObserver(
+    logger = { tag, msg -> println("[$tag] $msg") },
+    tag = "HTTP",
+    headerSanitizer = { key, value ->
+        if (key.equals("Authorization", ignoreCase = true)) "***" else value
+    },
+)
+
+// ── Observer custom: reporte a Crashlytics ──
+val crashlyticsObserver = object : NetworkEventObserver {
+    override fun onRequestStarted(url: String, method: String) { /* no-op */ }
+    override fun onResponseReceived(url: String, statusCode: Int, durationMs: Long) {
+        if (statusCode >= 500) {
+            crashlytics.log("Server error: $url → $statusCode (${durationMs}ms)")
+        }
+    }
+    override fun onRetryScheduled(url: String, attempt: Int, delayMs: Long) {
+        crashlytics.log("Retry #$attempt for $url in ${delayMs}ms")
+    }
+    override fun onRequestFailed(url: String, error: NetworkError) {
+        crashlytics.recordError(error.diagnostic?.cause ?: Exception(error.message))
+    }
+}
+
+// ── Ensamblar en el executor ──
+val executor = DefaultSafeRequestExecutor(
+    engine = KtorHttpEngine.create(config),
+    config = config,
+    classifier = KtorErrorClassifier(),
+    observers = listOf(loggingObserver, crashlyticsObserver), // ← ambos activos
+)
 ```
 
 ### Tabla de correspondencia completa
@@ -751,11 +1148,24 @@ fun provideAppDependencies(): AppDependencies {
 | Data SDK | Domain SDK | Dónde se conectan |
 |---|---|---|
 | `NetworkResult<T>` | `DomainResult<T>` | Repository impl con `fold` |
-| `NetworkError.*` (9 subtipos) | `DomainError.*` (6 subtipos) | `NetworkError.toDomainError()` |
-| `ResponseMetadata` | `ResultMetadata` / `DomainResultWithMeta` | Repository impl (opcional) |
-| `UserRemoteDataSource` | `ReadRepository<UserId, User>` | Repository impl |
-| `SessionController.state` | `NoParamsFlowGateway<T>` | Adapter class |
-| `SessionController.startSession` | `CommandGateway<SessionCredentials>` | Adapter class |
+| `NetworkResult.Success.metadata` | `ResultMetadata` / `DomainResultWithMeta` | `ResponseMetadata.toDomainMeta()` |
+| `NetworkError.*` (10 subtipos) | `DomainError.*` (7 subtipos) | `NetworkError.toDomainError()` |
+| `NetworkError.Cancelled` | `DomainError.Cancelled` | Mapeo semántico correcto |
+| `NetworkError.diagnostic?.cause` | `DomainError.Infrastructure.cause` | `Throwable?` preservado |
+| `RequestContext.operationId` | Use case genera el ID | Propagado vía repository impl |
+| `RequestContext.retryPolicyOverride` | Use case decide allowRetry | Repository propaga a `RequestContext` |
+| `ResponseMetadata.headers` | `ResultMetadata.extra` | Rate limits, ETags, etc. |
+| `SessionController.startSession` | `CommandGateway<SessionCredentials>` | `LoginGateway` adapter |
+| `SessionController.endSession` | `CommandGateway<Unit>` | `LogoutGateway` adapter |
+| `SessionController.invalidate` | `CommandGateway<Unit>` | `ForceLogoutGateway` adapter |
+| `SessionController.refreshSession` | `SuspendGateway<Unit, RefreshOutcome>` | `RefreshSessionGateway` adapter |
+| `SessionController.state` | `NoParamsFlowGateway<Boolean>` | `SessionStateGateway` adapter |
+| `SessionController.events` | `NoParamsFlowGateway<SessionEvent>` | `SessionEventsGateway` adapter |
+| `ResponseInterceptor` | `NoParamsFlowGateway<Int>` | `RateLimitGatewayImpl` (doble rol) |
+| `NetworkConfig` (por API) | Múltiples executors | Wiring multi-API |
+| `TrustPolicy` / `CertificatePin` | N/A (infra pura) | `KtorHttpEngine.create(config, trustPolicy)` |
+| `NetworkEventObserver` | N/A (infra pura) | `DefaultSafeRequestExecutor(observers = ...)` |
+| `LoggingObserver` | N/A (infra pura) | Configurado en el wiring |
 | DTOs (`@Serializable`) | Domain models (puros) | `Mapper<Dto, Model>` |
 | Batch HTTP requests | `WriteRepository.saveAll()` | Repository impl override |
 
@@ -1713,54 +2123,98 @@ The **Core Domain Platform** (this SDK) defines domain contracts. The **[Core Da
 ### Full Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                      YOUR APP (Android/iOS)                      │
-│                                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                      │
-│  │Feature A │  │Feature B │  │Feature C │  ← ViewModels         │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘                      │
-│       │              │              │                            │
-│  ┌────▼──────────────▼──────────────▼────┐                      │
-│  │     Domain Use Cases (this SDK)       │                      │
-│  │  PureUseCase · SuspendUseCase · Flow  │                      │
-│  └────┬──────────────┬──────────────┬────┘                      │
-│       │              │              │                            │
-│  ┌────▼──────────────▼──────────────▼────┐                      │
-│  │   Repository / Gateway Implementations│  ← YOU WRITE THESE   │
-│  │   (bridge between both SDKs)          │                      │
-│  └────┬──────────────┬──────────────┬────┘                      │
-│       │              │              │                            │
-│  ┌────▼────┐  ┌──────▼─────┐  ┌────▼──────────┐                │
-│  │network  │  │ network    │  │  security     │  ← Data SDK    │
-│  │ -core   │  │  -ktor     │  │   -core       │                │
-│  └─────────┘  └────────────┘  └───────────────┘                │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          YOUR APP (Android/iOS)                         │
+│                                                                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                              │
+│  │Feature A │  │Feature B │  │Feature C │  ← ViewModels                 │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                              │
+│       │              │              │                                    │
+│  ┌────▼──────────────▼──────────────▼────────────────┐                  │
+│  │     Domain Use Cases (this SDK)                   │                  │
+│  │  PureUseCase · SuspendUseCase · FlowUseCase       │                  │
+│  │  (generates operationId, decides retryOverride)    │                  │
+│  └────┬──────────────┬──────────────┬────────────────┘                  │
+│       │              │              │                                    │
+│  ┌────▼──────────────▼──────────────▼────────────────┐                  │
+│  │   Repository / Gateway Implementations            │  ← YOU WRITE     │
+│  │   (bridge between both SDKs)                      │    THESE         │
+│  │   Propagates: RequestContext, ResultMetadata       │                  │
+│  └────┬──────────────┬──────────┬────────────────────┘                  │
+│       │              │          │                                        │
+│  ┌────▼────┐  ┌──────▼────┐  ┌─▼───────────────────────────────────┐   │
+│  │network  │  │ network   │  │  security-core                      │   │
+│  │ -core   │  │  -ktor    │  │  SessionController · CredentialProv │   │
+│  │         │  │           │  │  SecretStore · TrustPolicy          │   │
+│  └─────────┘  └───────────┘  └─────────────────────────────────────┘   │
+│                 ↑ Data SDK                                              │
+│  Observability: LoggingObserver · MetricsObserver · TracingObserver     │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 1. Error mapping: `NetworkError` → `DomainError`
 
+> **Note:** `NetworkError` is **not** a `Throwable`. Each subtype has `diagnostic: Diagnostic?`
+> where `Diagnostic.cause: Throwable?` holds the original exception. The mapping must pass
+> `diagnostic?.cause` to `DomainError.Infrastructure.cause`, not the `NetworkError` itself.
+
 ```kotlin
 // Extension living in your data layer (NOT in either SDK)
 fun NetworkError.toDomainError(): DomainError = when (this) {
-    is NetworkError.Connectivity -> DomainError.Infrastructure("No internet connection", this)
-    is NetworkError.Timeout      -> DomainError.Infrastructure("Request timed out", this)
+    // ── Transport ──
+    is NetworkError.Connectivity -> DomainError.Infrastructure(
+        detail = "No internet connection",
+        cause = diagnostic?.cause,     // ← Throwable? from Data SDK
+    )
+    is NetworkError.Timeout -> DomainError.Infrastructure(
+        detail = "Request timed out",
+        cause = diagnostic?.cause,
+    )
+    is NetworkError.Cancelled -> DomainError.Cancelled(
+        detail = "Request cancelled",  // ← Intentional, not infra failure
+    )
+
+    // ── HTTP semantic ──
     is NetworkError.Authentication -> DomainError.Unauthorized("Authentication required")
     is NetworkError.Authorization  -> DomainError.Unauthorized("Access denied")
     is NetworkError.ClientError -> when (statusCode) {
-        404 -> DomainError.NotFound("Resource", diagnostic?.detail ?: "")
-        409 -> DomainError.Conflict(message)
-        422 -> DomainError.Validation("request", message)
-        else -> DomainError.Infrastructure("HTTP error $statusCode", this)
+        404  -> DomainError.NotFound("Resource", diagnostic?.description ?: "")
+        409  -> DomainError.Conflict(message)
+        422  -> DomainError.Validation("request", diagnostic?.description ?: message)
+        else -> DomainError.Infrastructure("HTTP error $statusCode", diagnostic?.cause)
     }
-    is NetworkError.ServerError    -> DomainError.Infrastructure("Server error ($statusCode)", this)
-    is NetworkError.Serialization  -> DomainError.Infrastructure("Failed to process response", this)
-    is NetworkError.ResponseValidation -> DomainError.Infrastructure(reason, this)
-    is NetworkError.Cancelled      -> DomainError.Infrastructure("Request cancelled", this)
-    is NetworkError.Unknown        -> DomainError.Unknown(message, this)
+    is NetworkError.ServerError -> DomainError.Infrastructure(
+        detail = "Server error ($statusCode)",
+        cause = diagnostic?.cause,
+    )
+
+    // ── Data processing ──
+    is NetworkError.Serialization -> DomainError.Infrastructure(
+        detail = "Failed to process response",
+        cause = diagnostic?.cause,
+    )
+    is NetworkError.ResponseValidation -> DomainError.Infrastructure(
+        detail = reason,
+        cause = diagnostic?.cause,
+    )
+
+    // ── Catch-all ──
+    is NetworkError.Unknown -> DomainError.Unknown(
+        detail = message,
+        cause = diagnostic?.cause,
+    )
 }
 ```
 
+**Why `Cancelled` is not `Infrastructure`:** A cancellation is intentional (user navigated away,
+coroutine scope was cancelled). Mapping it as `Infrastructure` would make it indistinguishable
+from a server crash in the ViewModel's `when`. With `DomainError.Cancelled`, consumers can
+suppress it without showing an error dialog.
+
 ### 2. Repository implementation (the bridge)
+
+> **Scenario:** A use case needs to fetch a user by ID. The Data SDK's DataSource returns
+> `NetworkResult<UserDto>`. The repository converts DTO → model and error → DomainError.
 
 ```kotlin
 class UserRepositoryImpl(
@@ -1778,49 +2232,402 @@ class UserRepositoryImpl(
 }
 ```
 
-### 3. Session adapter: `SessionController` → `NoParamsFlowGateway`
+### 3. `ResponseMetadata` propagation to the domain
+
+> **Scenario:** A support team needs the ViewModel to display the `requestId` when an
+> operation fails, so the user can report it. You also want to measure perceived latency
+> (`durationMs`) and how many retries were attempted (`attemptCount`).
 
 ```kotlin
-class SessionStateGateway(
-    private val sessionController: SessionController,   // ← Data SDK
-) : NoParamsFlowGateway<Boolean> {                      // ← Domain SDK contract
+class UserRepositoryWithMeta(
+    private val dataSource: UserRemoteDataSource,
+    private val mapper: Mapper<UserDto, User>,
+) : ReadRepository<UserId, User> {
 
-    override fun observe(): Flow<DomainResult<Boolean>> =
-        sessionController.state.map { state ->
-            (state is SessionState.Active).asSuccess()
+    // Returns DomainResultWithMeta so the ViewModel can access metadata
+    suspend fun findByIdWithMeta(id: UserId): DomainResultWithMeta<User?> {
+        val networkResult = dataSource.getUser(id.value)
+        return when (networkResult) {
+            is NetworkResult.Success -> DomainResultWithMeta(
+                result = mapper.map(networkResult.data).asSuccess(),
+                metadata = networkResult.metadata.toDomainMeta(),
+            )
+            is NetworkResult.Failure -> DomainResultWithMeta(
+                result = domainFailure(networkResult.error.toDomainError()),
+                // On failure you can also propagate metadata if available
+            )
         }
+    }
+
+    // Standard contract (no metadata) remains available
+    override suspend fun findById(id: UserId): DomainResult<User?> =
+        findByIdWithMeta(id).result
+}
+
+// Extension in your data layer
+fun ResponseMetadata.toDomainMeta(): ResultMetadata = ResultMetadata(
+    requestId = requestId,
+    durationMs = durationMs,
+    attemptCount = attemptCount,
+    extra = buildMap {
+        headers["X-RateLimit-Remaining"]?.firstOrNull()?.let { put("rateLimitRemaining", it) }
+        headers["ETag"]?.firstOrNull()?.let { put("etag", it) }
+    },
+)
+```
+
+**Usage in the ViewModel:**
+
+```kotlin
+val (result, meta) = userRepo.findByIdWithMeta(userId)
+result.fold(
+    onSuccess = { user -> showUser(user) },
+    onFailure = { error ->
+        showError(error.message)
+        // User can report the requestId to support
+        analytics.logError(requestId = meta.requestId, duration = meta.durationMs)
+    },
+)
+```
+
+### 4. `RequestContext` — domain → HTTP correlation
+
+> **Scenario:** The SRE team wants to see in Datadog which use case generated each HTTP request.
+> `PlaceOrderUseCase` generates an `operationId = "place-order"` that travels all the way to the
+> HTTP headers, correlating the domain operation with the infrastructure trace.
+
+```kotlin
+// ── Contract in your domain layer (repository interface) ──
+interface OrderRepository : WriteRepository<Order> {
+    suspend fun placeOrder(order: Order, operationId: String): DomainResult<Unit>
+}
+
+// ── Implementation in your data layer (bridge) ──
+class OrderRepositoryImpl(
+    private val dataSource: OrderRemoteDataSource,
+) : OrderRepository {
+
+    override suspend fun placeOrder(order: Order, operationId: String): DomainResult<Unit> {
+        val context = RequestContext(
+            operationId = operationId,              // ← From the use case
+            tags = mapOf("orderId" to order.id),    // ← Business context
+            requiresAuth = true,
+        )
+        val result = dataSource.createOrder(order.toDto(), context)
+        return result.fold(
+            onSuccess = { Unit.asSuccess() },
+            onFailure = { error -> domainFailure(error.toDomainError()) },
+        )
+    }
+
+    // Standard save/delete for WriteRepository
+    override suspend fun save(entity: Order) = placeOrder(entity, "save-order")
+    override suspend fun delete(entity: Order): DomainResult<Unit> { /* ... */ }
+}
+
+// ── Use case generates the operationId ──
+class PlaceOrderUseCase(
+    private val orderRepo: OrderRepository,
+    private val deps: DomainDependencies,
+) : SuspendUseCase<PlaceOrderInput, Unit> {
+
+    override suspend fun invoke(input: PlaceOrderInput): DomainResult<Unit> {
+        val order = Order(id = deps.idProvider.generate(), /* ... */)
+        return orderRepo.placeOrder(order, operationId = "place-order")
+    }
 }
 ```
 
-### 4. Full wiring in the app
+In Datadog you'll see: `operation_id=place-order, orderId=abc-123` linked to the HTTP request.
+
+### 5. `RetryPolicy` override from the domain
+
+> **Scenario:** A payment must NOT be retried — retrying could charge the user twice.
+> The use case tells the repository this operation is `RetryPolicy.None`.
 
 ```kotlin
-// Application.onCreate or AppDelegate — assembly point
-fun provideAppDependencies(): AppDependencies {
-    // ── Domain SDK ──
-    val domainDeps = DomainDependencies(
-        clock = ClockProvider { System.currentTimeMillis() },
-        idProvider = IdProvider { UUID.randomUUID().toString() },
+// ── Repository contract (domain) ──
+interface PaymentRepository : Repository {
+    suspend fun processPayment(payment: Payment, allowRetry: Boolean = false): DomainResult<PaymentResult>
+}
+
+// ── Implementation (bridge) ──
+class PaymentRepositoryImpl(
+    private val dataSource: PaymentRemoteDataSource,
+) : PaymentRepository {
+
+    override suspend fun processPayment(
+        payment: Payment,
+        allowRetry: Boolean,
+    ): DomainResult<PaymentResult> {
+        val context = RequestContext(
+            operationId = "process-payment",
+            // If domain says no retry, override the policy
+            retryPolicyOverride = if (!allowRetry) RetryPolicy.None else null,
+            requiresAuth = true,
+        )
+        val result = dataSource.charge(payment.toDto(), context)
+        return result.fold(
+            onSuccess = { dto -> PaymentResult(dto.transactionId).asSuccess() },
+            onFailure = { error -> domainFailure(error.toDomainError()) },
+        )
+    }
+}
+
+// ── Use case ──
+class ProcessPaymentUseCase(
+    private val paymentRepo: PaymentRepository,
+) : SuspendUseCase<Payment, PaymentResult> {
+
+    override suspend fun invoke(input: Payment): DomainResult<PaymentResult> =
+        paymentRepo.processPayment(input, allowRetry = false) // ← NEVER retry payments
+}
+```
+
+### 6. Full session lifecycle
+
+> **Scenario:** The app needs: login, logout, force-logout on 401, token refresh,
+> and session event observation (for analytics and UI updates).
+
+```kotlin
+// ── Adapter: login ──
+class LoginGateway(
+    private val session: SessionController,
+) : CommandGateway<SessionCredentials> {
+
+    override suspend fun dispatch(input: SessionCredentials): DomainResult<Unit> =
+        runDomainCatching { session.startSession(input) }
+}
+
+// ── Adapter: voluntary logout ──
+class LogoutGateway(
+    private val session: SessionController,
+) : CommandGateway<Unit> {
+
+    override suspend fun dispatch(input: Unit): DomainResult<Unit> =
+        runDomainCatching { session.endSession() }
+}
+
+// ── Adapter: force-logout (401 or compromised security) ──
+class ForceLogoutGateway(
+    private val session: SessionController,
+) : CommandGateway<Unit> {
+
+    override suspend fun dispatch(input: Unit): DomainResult<Unit> =
+        runDomainCatching { session.invalidate() }
+}
+
+// ── Adapter: token refresh ──
+// RefreshOutcome is a sealed from the Data SDK: Refreshed, NotNeeded, Failed
+class RefreshSessionGateway(
+    private val session: SessionController,
+) : SuspendGateway<Unit, RefreshOutcome> {
+
+    override suspend fun execute(input: Unit): DomainResult<RefreshOutcome> =
+        runDomainCatching { session.refreshSession() }
+}
+
+// ── Adapter: session state (StateFlow → FlowGateway) ──
+class SessionStateGateway(
+    private val session: SessionController,
+) : NoParamsFlowGateway<Boolean> {
+
+    override fun observe(): Flow<DomainResult<Boolean>> =
+        session.state.map { state ->
+            (state is SessionState.Active).asSuccess()
+        }
+}
+
+// ── Adapter: session events for analytics ──
+class SessionEventsGateway(
+    private val session: SessionController,
+) : NoParamsFlowGateway<SessionEvent> {
+
+    override fun observe(): Flow<DomainResult<SessionEvent>> =
+        session.events.map { event -> event.asSuccess() }
+}
+```
+
+**Usage in a use case:**
+
+```kotlin
+class LogoutUseCase(
+    private val logout: LogoutGateway,
+    private val clearCache: ClearCacheGateway, // another gateway of yours
+) : SuspendUseCase<Unit, Unit> {
+
+    override suspend fun invoke(input: Unit): DomainResult<Unit> =
+        logout.dispatch(Unit).flatMap { clearCache.dispatch(Unit) }
+}
+```
+
+### 7. Multiple APIs with different configurations
+
+> **Scenario:** `PlaceOrderUseCase` orchestrates 3 APIs (orders, inventory, payments) each
+> with its own `NetworkConfig`, executor, and base URL.
+
+```kotlin
+fun provideMultiApiDependencies(): AppDependencies {
+    // ── Per-API configurations ──
+    val ordersConfig = NetworkConfig(
+        baseUrl = "https://orders.api.example.com",
+        connectTimeout = 10_000L,
+        retryPolicy = RetryPolicy.ExponentialBackoff(maxRetries = 3),
+    )
+    val inventoryConfig = NetworkConfig(
+        baseUrl = "https://inventory.api.example.com",
+        connectTimeout = 5_000L,
+        retryPolicy = RetryPolicy.FixedDelay(maxRetries = 2, delay = 1_000L),
+    )
+    val paymentsConfig = NetworkConfig(
+        baseUrl = "https://payments.api.example.com",
+        connectTimeout = 30_000L,
+        retryPolicy = RetryPolicy.None, // ← Payments: NEVER retry by default
     )
 
-    // ── Data SDK ──
-    val networkConfig = NetworkConfig(baseUrl = "https://api.example.com")
-    val httpEngine = KtorHttpEngine(networkConfig)
-    val executor = SafeRequestExecutor(httpEngine, retryPolicy, observer)
+    // ── Independent executors per API ──
+    val ordersExecutor = DefaultSafeRequestExecutor(
+        engine = KtorHttpEngine.create(ordersConfig),
+        config = ordersConfig,
+        classifier = KtorErrorClassifier(),
+        observers = listOf(loggingObserver, metricsObserver),
+    )
+    val inventoryExecutor = DefaultSafeRequestExecutor(
+        engine = KtorHttpEngine.create(inventoryConfig),
+        config = inventoryConfig,
+        classifier = KtorErrorClassifier(),
+    )
+    val paymentsExecutor = DefaultSafeRequestExecutor(
+        engine = KtorHttpEngine.create(paymentsConfig, bankTrustPolicy), // ← TrustPolicy
+        config = paymentsConfig,
+        classifier = KtorErrorClassifier(),
+    )
 
-    // ── Bridge: DataSources + Repositories ──
-    val userDataSource = UserRemoteDataSource(executor)
-    val userMapper = Mapper<UserDto, User> { dto ->
-        User(id = UserId(dto.id), name = dto.displayName, email = dto.email)
-    }
-    val userRepo = UserRepositoryImpl(userDataSource, userMapper)
+    // ── DataSources ──
+    val orderDataSource = OrderRemoteDataSource(ordersExecutor)
+    val inventoryDataSource = InventoryRemoteDataSource(inventoryExecutor)
+    val paymentDataSource = PaymentRemoteDataSource(paymentsExecutor)
 
-    // ── Use Cases (Domain SDK) ──
-    val getUser = GetUserUseCase(userRepo)
-    val createUser = CreateUserUseCase(domainDeps, userRepo, nameValidator)
+    // ── Repositories (bridge) ──
+    val orderRepo = OrderRepositoryImpl(orderDataSource)
+    val inventoryGateway = InventoryGatewayImpl(inventoryDataSource)
+    val paymentRepo = PaymentRepositoryImpl(paymentDataSource)
 
-    return AppDependencies(getUser, createUser, /* ... */)
+    // ── Use case orchestrates all 3 APIs ──
+    val placeOrder = PlaceOrderUseCase(orderRepo, inventoryGateway, paymentRepo, domainDeps)
+
+    return AppDependencies(placeOrder, /* ... */)
 }
+```
+
+### 8. Exposing Rate Limits to the domain
+
+> **Scenario:** The API returns `X-RateLimit-Remaining` in headers. The domain needs
+> a gateway that exposes the current rate limit to decide on preventive throttling
+> (e.g., disable the "Refresh" button when few requests remain).
+
+```kotlin
+// ── Reactive gateway (domain) ──
+interface RateLimitGateway : NoParamsFlowGateway<Int> // Remaining count
+
+// ── Implementation (bridge) — uses ResponseInterceptor from Data SDK ──
+class RateLimitGatewayImpl : RateLimitGateway, ResponseInterceptor {
+    private val _remaining = MutableStateFlow(Int.MAX_VALUE)
+
+    // ResponseInterceptor from Data SDK — intercepts every HTTP response
+    override suspend fun intercept(response: InterceptedResponse): InterceptedResponse {
+        response.headers["X-RateLimit-Remaining"]?.firstOrNull()?.toIntOrNull()?.let {
+            _remaining.value = it
+        }
+        return response
+    }
+
+    // NoParamsFlowGateway from Domain SDK — exposes to the domain
+    override fun observe(): Flow<DomainResult<Int>> =
+        _remaining.map { it.asSuccess() }
+}
+
+// Register as ResponseInterceptor when creating the executor:
+val rateLimitGateway = RateLimitGatewayImpl()
+val executor = DefaultSafeRequestExecutor(
+    engine = engine,
+    config = config,
+    classifier = KtorErrorClassifier(),
+    responseInterceptors = listOf(rateLimitGateway), // ← dual role
+)
+```
+
+### 9. `TrustPolicy` and Certificate Pinning in the wiring
+
+> **Scenario:** A banking app needs MITM attack protection. The Data SDK supports
+> `TrustPolicy` with `CertificatePin` that validates server certificates against
+> known pins.
+
+```kotlin
+// ── TrustPolicy for banking / healthcare ──
+val bankTrustPolicy = DefaultTrustPolicy(
+    pins = listOf(
+        CertificatePin(
+            hostname = "payments.api.example.com",
+            sha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", // SHA-256 of cert
+        ),
+        CertificatePin(
+            hostname = "payments.api.example.com",
+            sha256 = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=", // Backup pin
+        ),
+    ),
+)
+
+// Pass when creating the engine
+val secureEngine = KtorHttpEngine.create(
+    config = paymentsConfig,
+    trustPolicy = bankTrustPolicy,    // ← Pinning active
+)
+val secureExecutor = DefaultSafeRequestExecutor(
+    engine = secureEngine,
+    config = paymentsConfig,
+    classifier = KtorErrorClassifier(),
+)
+```
+
+### 10. Observers in the wiring
+
+> **Scenario:** You need HTTP request logging in development, latency metrics in
+> production, and a custom observer that reports errors to Crashlytics.
+
+```kotlin
+// ── LoggingObserver (Data SDK) — debug only ──
+val loggingObserver = LoggingObserver(
+    logger = { tag, msg -> println("[$tag] $msg") },
+    tag = "HTTP",
+    headerSanitizer = { key, value ->
+        if (key.equals("Authorization", ignoreCase = true)) "***" else value
+    },
+)
+
+// ── Custom observer: Crashlytics reporting ──
+val crashlyticsObserver = object : NetworkEventObserver {
+    override fun onRequestStarted(url: String, method: String) { /* no-op */ }
+    override fun onResponseReceived(url: String, statusCode: Int, durationMs: Long) {
+        if (statusCode >= 500) {
+            crashlytics.log("Server error: $url → $statusCode (${durationMs}ms)")
+        }
+    }
+    override fun onRetryScheduled(url: String, attempt: Int, delayMs: Long) {
+        crashlytics.log("Retry #$attempt for $url in ${delayMs}ms")
+    }
+    override fun onRequestFailed(url: String, error: NetworkError) {
+        crashlytics.recordError(error.diagnostic?.cause ?: Exception(error.message))
+    }
+}
+
+// ── Assemble in the executor ──
+val executor = DefaultSafeRequestExecutor(
+    engine = KtorHttpEngine.create(config),
+    config = config,
+    classifier = KtorErrorClassifier(),
+    observers = listOf(loggingObserver, crashlyticsObserver), // ← both active
+)
 ```
 
 ### Full correspondence table
@@ -1828,11 +2635,24 @@ fun provideAppDependencies(): AppDependencies {
 | Data SDK | Domain SDK | Where they connect |
 |---|---|---|
 | `NetworkResult<T>` | `DomainResult<T>` | Repository impl via `fold` |
-| `NetworkError.*` (9 subtypes) | `DomainError.*` (6 subtypes) | `NetworkError.toDomainError()` |
-| `ResponseMetadata` | `ResultMetadata` / `DomainResultWithMeta` | Repository impl (optional) |
-| `UserRemoteDataSource` | `ReadRepository<UserId, User>` | Repository impl |
-| `SessionController.state` | `NoParamsFlowGateway<T>` | Adapter class |
-| `SessionController.startSession` | `CommandGateway<SessionCredentials>` | Adapter class |
+| `NetworkResult.Success.metadata` | `ResultMetadata` / `DomainResultWithMeta` | `ResponseMetadata.toDomainMeta()` |
+| `NetworkError.*` (10 subtypes) | `DomainError.*` (7 subtypes) | `NetworkError.toDomainError()` |
+| `NetworkError.Cancelled` | `DomainError.Cancelled` | Correct semantic mapping |
+| `NetworkError.diagnostic?.cause` | `DomainError.Infrastructure.cause` | `Throwable?` preserved |
+| `RequestContext.operationId` | Use case generates the ID | Propagated via repository impl |
+| `RequestContext.retryPolicyOverride` | Use case decides allowRetry | Repository propagates to `RequestContext` |
+| `ResponseMetadata.headers` | `ResultMetadata.extra` | Rate limits, ETags, etc. |
+| `SessionController.startSession` | `CommandGateway<SessionCredentials>` | `LoginGateway` adapter |
+| `SessionController.endSession` | `CommandGateway<Unit>` | `LogoutGateway` adapter |
+| `SessionController.invalidate` | `CommandGateway<Unit>` | `ForceLogoutGateway` adapter |
+| `SessionController.refreshSession` | `SuspendGateway<Unit, RefreshOutcome>` | `RefreshSessionGateway` adapter |
+| `SessionController.state` | `NoParamsFlowGateway<Boolean>` | `SessionStateGateway` adapter |
+| `SessionController.events` | `NoParamsFlowGateway<SessionEvent>` | `SessionEventsGateway` adapter |
+| `ResponseInterceptor` | `NoParamsFlowGateway<Int>` | `RateLimitGatewayImpl` (dual role) |
+| `NetworkConfig` (per API) | Multiple executors | Multi-API wiring |
+| `TrustPolicy` / `CertificatePin` | N/A (pure infra) | `KtorHttpEngine.create(config, trustPolicy)` |
+| `NetworkEventObserver` | N/A (pure infra) | `DefaultSafeRequestExecutor(observers = ...)` |
+| `LoggingObserver` | N/A (pure infra) | Configured in wiring |
 | DTOs (`@Serializable`) | Domain models (pure) | `Mapper<Dto, Model>` |
 | Batch HTTP requests | `WriteRepository.saveAll()` | Repository impl override |
 

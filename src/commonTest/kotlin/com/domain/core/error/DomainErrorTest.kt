@@ -131,6 +131,31 @@ class DomainErrorTest {
         assertNull(DomainError.Unknown().cause)
     }
 
+    // ── Cancelled ────────────────────────────────────────────────────────────
+
+    @Test
+    fun `Cancelled has default message`() {
+        val error = DomainError.Cancelled()
+        assertEquals("Operation was cancelled.", error.message)
+        assertEquals("Operation was cancelled.", error.detail)
+    }
+
+    @Test
+    fun `Cancelled accepts custom detail`() {
+        val error = DomainError.Cancelled("User navigated away")
+        assertEquals("User navigated away", error.message)
+    }
+
+    @Test
+    fun `Cancelled equality is structural`() {
+        assertEquals(DomainError.Cancelled(), DomainError.Cancelled())
+        assertEquals(
+            DomainError.Cancelled("custom"),
+            DomainError.Cancelled("custom"),
+        )
+        assertNotEquals(DomainError.Cancelled(), DomainError.Cancelled("custom"))
+    }
+
     // ── Sealed when exhaustiveness ────────────────────────────────────────────
 
     @Test
@@ -141,6 +166,7 @@ class DomainErrorTest {
             DomainError.Unauthorized(),
             DomainError.Conflict(detail = "c"),
             DomainError.Infrastructure(detail = "i"),
+            DomainError.Cancelled(),
             DomainError.Unknown(),
         )
         val labels = errors.map { error ->
@@ -150,11 +176,12 @@ class DomainErrorTest {
                 is DomainError.Unauthorized -> "Unauthorized"
                 is DomainError.Conflict -> "Conflict"
                 is DomainError.Infrastructure -> "Infrastructure"
+                is DomainError.Cancelled -> "Cancelled"
                 is DomainError.Unknown -> "Unknown"
             }
         }
         assertEquals(
-            listOf("Validation", "NotFound", "Unauthorized", "Conflict", "Infrastructure", "Unknown"),
+            listOf("Validation", "NotFound", "Unauthorized", "Conflict", "Infrastructure", "Cancelled", "Unknown"),
             labels,
         )
     }
