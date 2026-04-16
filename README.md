@@ -20,15 +20,31 @@ Dependencias: kotlinx-coroutines-core (única)
 
 ## Tabla de Contenidos
 
+- [¿Por qué este SDK?](#por-qué-este-sdk)
 - [Vista General de Arquitectura](#vista-general-de-arquitectura)
 - [Estructura de Paquetes](#estructura-de-paquetes)
 - [Componentes Principales](#componentes-principales)
+- [Referencia Completa de Casos de Uso](#referencia-completa-de-casos-de-uso)
 - [Guía de Implementación Paso a Paso](#guía-de-implementación-paso-a-paso)
 - [Guía de Integración Android](#guía-de-integración-android)
 - [Guía de Integración iOS](#guía-de-integración-ios)
 - [Referencia de Manejo de Errores](#referencia-de-manejo-de-errores)
 - [Estrategia de Testing](#estrategia-de-testing)
 - [Versionado](#versionado)
+
+---
+
+## ¿Por qué este SDK?
+
+| Ventaja | Detalle |
+|---|---|
+| **Dominio puro** | Tu lógica de negocio no depende de Room, Retrofit, Ktor, CoreData, SwiftUI ni Compose. Si mañana cambias de base de datos, el dominio no se entera. |
+| **Sin excepciones** | Todos los contratos retornan `DomainResult<T>`. El error es un valor explícito y tipado, nunca una excepción que se propaga silenciosamente. |
+| **Testeable sin mocking** | Todos los contratos son `fun interface`. En tests creas stubs con una lambda de una línea. Cero Mockito, cero MockK. |
+| **Determinista** | El tiempo (`ClockProvider`) y la generación de IDs (`IdProvider`) son dependencias inyectadas. En tests pasas valores fijos → resultados 100% reproducibles. |
+| **Composable** | Validadores se encadenan con `andThen`. Políticas se componen con `and` / `or` / `negate`. Results se combinan con `zip`. |
+| **Multiplataforma** | Un solo módulo de dominio para Android + iOS + Desktop. El mismo código, las mismas reglas de negocio. |
+| **Clean Architecture forzada** | El compilador impide que el dominio importe de data o UI. La dirección de dependencias se garantiza en tiempo de compilación. |
 
 ---
 
@@ -192,6 +208,189 @@ sequenceDiagram
     Data-->>Repo: DomainResult<Unit>
     Repo-->>UC: DomainResult<Unit>
     UC-->>App: DomainResult<User>
+```
+
+---
+
+## Referencia Completa de Casos de Uso
+
+El SDK provee **5 contratos de caso de uso**. Todos son `fun interface` (SAM), lo que permite
+implementarlos como lambdas o como clases:
+
+| Contrato | Firma | Cuándo usar |
+|---|---|---|
+| `PureUseCase<I, O>` | `(I) → DomainResult<O>` | Lógica síncrona y pura. Sin I/O. Seguro desde main thread |
+| `SuspendUseCase<I, O>` | `suspend (I) → DomainResult<O>` | Operaciones async de resultado único (crear, actualizar, buscar) |
+| `FlowUseCase<I, O>` | `(I) → Flow<DomainResult<O>>` | Observar cambios en el tiempo (streams reactivos) |
+| `NoParamsUseCase<O>` | `suspend () → DomainResult<O>` | Variante sin parámetros de `SuspendUseCase` |
+| `NoParamsFlowUseCase<O>` | `() → Flow<DomainResult<O>>` | Variante sin parámetros de `FlowUseCase` |
+
+> Todos retornan `DomainResult<T>`. Nunca lanzan excepciones al consumidor.
+
+### 1. PureUseCase — Lógica síncrona y pura
+
+Para cálculos, transformaciones, reglas de negocio que **no tocan red ni disco**.
+Seguro desde cualquier hilo, incluyendo el main thread.
+
+```kotlin
+data class PriceParams(val basePrice: Double, val discountPercent: Double)
+data class PriceResult(val original: Double, val discounted: Double, val savings: Double)
+
+class CalculateDiscountedPrice : PureUseCase<PriceParams, PriceResult> {
+
+    override fun invoke(params: PriceParams): DomainResult<PriceResult> {
+        if (params.basePrice < 0)
+            return domainFailure(DomainError.Validation("basePrice", "no puede ser negativo"))
+        if (params.discountPercent !in 0.0..100.0)
+            return domainFailure(DomainError.Validation("discountPercent", "debe estar entre 0 y 100"))
+
+        val savings = params.basePrice * (params.discountPercent / 100.0)
+        return PriceResult(
+            original = params.basePrice,
+            discounted = params.basePrice - savings,
+            savings = savings,
+        ).asSuccess()
+    }
+}
+
+// Uso — síncrono, se puede llamar desde cualquier hilo:
+val result = calculateDiscountedPrice(PriceParams(basePrice = 100.0, discountPercent = 15.0))
+// → Success(PriceResult(original=100.0, discounted=85.0, savings=15.0))
+```
+
+### 2. SuspendUseCase — Operación async de resultado único
+
+Para operaciones que requieren I/O (persistir, consultar, llamar API) y producen **un solo valor**.
+
+```kotlin
+data class CreateTaskParams(val title: String)
+
+class CreateTaskUseCase(
+    private val deps: DomainDependencies,
+    private val repository: TaskRepository,
+    private val titleValidator: Validator<String>,
+) : SuspendUseCase<CreateTaskParams, Task> {
+
+    override suspend fun invoke(params: CreateTaskParams): DomainResult<Task> {
+        // 1. Validar
+        titleValidator.validate(params.title).let {
+            if (it.isFailure) return it as DomainResult.Failure
+        }
+
+        // 2. Construir agregado
+        val task = Task(
+            id = TaskId(deps.idProvider.next()),
+            title = params.title.trim(),
+            completed = false,
+            createdAt = deps.clock.nowMillis(),
+        )
+
+        // 3. Persistir
+        return repository.save(task).map { task }
+    }
+}
+
+// Uso — dentro de una coroutine:
+viewModelScope.launch {
+    createTask(CreateTaskParams("Comprar leche"))
+        .onSuccess { task -> /* actualizar UI */ }
+        .onFailure { error -> /* mostrar error */ }
+}
+```
+
+### 3. FlowUseCase — Observar datos que cambian en el tiempo
+
+Para streams reactivos: lista que se actualiza, notificaciones en tiempo real, cambios de estado.
+Cada emisión puede ser éxito o fallo individualmente sin cancelar el stream.
+
+```kotlin
+data class TaskFilterParams(val completed: Boolean)
+
+class ObserveTasksByStatus(
+    private val repository: TaskRepository,
+) : FlowUseCase<TaskFilterParams, List<Task>> {
+
+    override fun invoke(params: TaskFilterParams): Flow<DomainResult<List<Task>>> {
+        return repository.observeByStatus(params.completed)
+    }
+}
+
+// Uso — colectar el Flow:
+observeTasksByStatus(TaskFilterParams(completed = false))
+    .collect { result ->
+        result
+            .onSuccess { tasks -> _uiState.value = UiState.Loaded(tasks) }
+            .onFailure { error -> _uiState.value = UiState.Error(error.message) }
+    }
+```
+
+### 4. NoParamsUseCase — Async sin parámetros
+
+Igual que `SuspendUseCase` pero cuando **no necesitas parámetros**. Evita pasar `Unit`.
+
+```kotlin
+class GetCurrentUser(
+    private val userRepository: UserRepository,
+    private val sessionGateway: SuspendGateway<Unit, UserId>,
+) : NoParamsUseCase<User> {
+
+    override suspend fun invoke(): DomainResult<User> {
+        val userIdResult = sessionGateway.execute(Unit)
+        if (userIdResult.isFailure) return userIdResult as DomainResult.Failure
+
+        val userId = userIdResult.getOrNull()!!
+
+        return userRepository.findById(userId).flatMap { user ->
+            if (user != null) user.asSuccess()
+            else domainFailure(DomainError.NotFound("User", userId.value))
+        }
+    }
+}
+
+// Uso — sin pasar parámetros:
+val result = getCurrentUser()
+```
+
+### 5. NoParamsFlowUseCase — Stream reactivo sin parámetros
+
+Ideal para observar datos globales que no requieren filtro.
+
+```kotlin
+class ObserveNotifications(
+    private val notificationRepository: NotificationRepository,
+) : NoParamsFlowUseCase<List<Notification>> {
+
+    override fun invoke(): Flow<DomainResult<List<Notification>>> {
+        return notificationRepository.observeAll()
+    }
+}
+
+// Uso:
+observeNotifications()
+    .collect { result ->
+        result.onSuccess { notifications -> updateBadge(notifications.size) }
+    }
+```
+
+### Diagrama de decisión
+
+```mermaid
+flowchart TD
+    A["¿Qué tipo de caso de uso necesito?"] --> B{"¿Necesita I/O?"}
+    B -->|"No — cálculo puro"| C["PureUseCase"]
+    B -->|"Sí"| D{"¿Retorna un stream?"}
+    D -->|"No — valor único"| E{"¿Necesita parámetros?"}
+    D -->|"Sí — múltiples valores"| F{"¿Necesita parámetros?"}
+    E -->|"Sí"| G["SuspendUseCase"]
+    E -->|"No"| H["NoParamsUseCase"]
+    F -->|"Sí"| I["FlowUseCase"]
+    F -->|"No"| J["NoParamsFlowUseCase"]
+
+    style C fill:#4CAF50,color:#fff
+    style G fill:#2196F3,color:#fff
+    style H fill:#2196F3,color:#fff
+    style I fill:#9C27B0,color:#fff
+    style J fill:#9C27B0,color:#fff
 ```
 
 ---
@@ -571,6 +770,20 @@ Dependencies: kotlinx-coroutines-core (only)
 
 ---
 
+## Why this SDK?
+
+| Advantage | Detail |
+|---|---|
+| **Pure domain** | Your business logic does not depend on Room, Retrofit, Ktor, CoreData, SwiftUI or Compose. If you swap databases tomorrow, the domain doesn't know or care. |
+| **No exceptions** | All contracts return `DomainResult<T>`. Errors are explicit, typed values — never silently propagating exceptions. |
+| **Testable without mocking** | All contracts are `fun interface`. In tests, create stubs with a one-line lambda. Zero Mockito, zero MockK. |
+| **Deterministic** | Time (`ClockProvider`) and ID generation (`IdProvider`) are injected dependencies. In tests, pass fixed values → 100% reproducible results. |
+| **Composable** | Validators chain with `andThen`. Policies compose with `and` / `or` / `negate`. Results combine with `zip`. |
+| **Multiplatform** | A single domain module for Android + iOS + Desktop. Same code, same business rules. |
+| **Enforced Clean Architecture** | The compiler prevents the domain from importing data or UI. Dependency direction is guaranteed at compile time. |
+
+---
+
 ## Architecture Overview
 
 ```mermaid
@@ -731,6 +944,182 @@ sequenceDiagram
     Data-->>Repo: DomainResult<Unit>
     Repo-->>UC: DomainResult<Unit>
     UC-->>App: DomainResult<User>
+```
+
+---
+
+## Complete Use Case Reference
+
+The SDK provides **5 use case contracts**. All are `fun interface` (SAM), allowing
+implementation as lambdas or classes:
+
+| Contract | Signature | When to use |
+|---|---|---|
+| `PureUseCase<I, O>` | `(I) → DomainResult<O>` | Synchronous, pure logic. No I/O. Safe from main thread |
+| `SuspendUseCase<I, O>` | `suspend (I) → DomainResult<O>` | Async single-result operations (create, update, fetch) |
+| `FlowUseCase<I, O>` | `(I) → Flow<DomainResult<O>>` | Observe changes over time (reactive streams) |
+| `NoParamsUseCase<O>` | `suspend () → DomainResult<O>` | No-params variant of `SuspendUseCase` |
+| `NoParamsFlowUseCase<O>` | `() → Flow<DomainResult<O>>` | No-params variant of `FlowUseCase` |
+
+> All return `DomainResult<T>`. They never throw exceptions to the consumer.
+
+### 1. PureUseCase — Synchronous, pure logic
+
+For calculations, transformations, business rules that **don’t touch network or disk**.
+Safe from any thread, including the main thread.
+
+```kotlin
+data class PriceParams(val basePrice: Double, val discountPercent: Double)
+data class PriceResult(val original: Double, val discounted: Double, val savings: Double)
+
+class CalculateDiscountedPrice : PureUseCase<PriceParams, PriceResult> {
+
+    override fun invoke(params: PriceParams): DomainResult<PriceResult> {
+        if (params.basePrice < 0)
+            return domainFailure(DomainError.Validation("basePrice", "must not be negative"))
+        if (params.discountPercent !in 0.0..100.0)
+            return domainFailure(DomainError.Validation("discountPercent", "must be between 0 and 100"))
+
+        val savings = params.basePrice * (params.discountPercent / 100.0)
+        return PriceResult(
+            original = params.basePrice,
+            discounted = params.basePrice - savings,
+            savings = savings,
+        ).asSuccess()
+    }
+}
+
+// Usage — synchronous, callable from any thread:
+val result = calculateDiscountedPrice(PriceParams(basePrice = 100.0, discountPercent = 15.0))
+// → Success(PriceResult(original=100.0, discounted=85.0, savings=15.0))
+```
+
+### 2. SuspendUseCase — Async single-result
+
+For operations requiring I/O (persist, query, call API) that produce **one value**.
+
+```kotlin
+data class CreateTaskParams(val title: String)
+
+class CreateTaskUseCase(
+    private val deps: DomainDependencies,
+    private val repository: TaskRepository,
+    private val titleValidator: Validator<String>,
+) : SuspendUseCase<CreateTaskParams, Task> {
+
+    override suspend fun invoke(params: CreateTaskParams): DomainResult<Task> {
+        titleValidator.validate(params.title).let {
+            if (it.isFailure) return it as DomainResult.Failure
+        }
+        val task = Task(
+            id = TaskId(deps.idProvider.next()),
+            title = params.title.trim(),
+            completed = false,
+            createdAt = deps.clock.nowMillis(),
+        )
+        return repository.save(task).map { task }
+    }
+}
+
+// Usage — inside a coroutine:
+viewModelScope.launch {
+    createTask(CreateTaskParams("Buy milk"))
+        .onSuccess { task -> /* update UI */ }
+        .onFailure { error -> /* show error */ }
+}
+```
+
+### 3. FlowUseCase — Observe data over time
+
+For reactive streams: self-updating lists, real-time notifications, state changes.
+Each emission can be success or failure individually without cancelling the stream.
+
+```kotlin
+data class TaskFilterParams(val completed: Boolean)
+
+class ObserveTasksByStatus(
+    private val repository: TaskRepository,
+) : FlowUseCase<TaskFilterParams, List<Task>> {
+
+    override fun invoke(params: TaskFilterParams): Flow<DomainResult<List<Task>>> {
+        return repository.observeByStatus(params.completed)
+    }
+}
+
+// Usage — collect the Flow:
+observeTasksByStatus(TaskFilterParams(completed = false))
+    .collect { result ->
+        result
+            .onSuccess { tasks -> _uiState.value = UiState.Loaded(tasks) }
+            .onFailure { error -> _uiState.value = UiState.Error(error.message) }
+    }
+```
+
+### 4. NoParamsUseCase — Async without parameters
+
+Same as `SuspendUseCase` but when **no parameters are needed**. Avoids passing `Unit`.
+
+```kotlin
+class GetCurrentUser(
+    private val userRepository: UserRepository,
+    private val sessionGateway: SuspendGateway<Unit, UserId>,
+) : NoParamsUseCase<User> {
+
+    override suspend fun invoke(): DomainResult<User> {
+        val userIdResult = sessionGateway.execute(Unit)
+        if (userIdResult.isFailure) return userIdResult as DomainResult.Failure
+        val userId = userIdResult.getOrNull()!!
+        return userRepository.findById(userId).flatMap { user ->
+            if (user != null) user.asSuccess()
+            else domainFailure(DomainError.NotFound("User", userId.value))
+        }
+    }
+}
+
+// Usage — no parameters:
+val result = getCurrentUser()
+```
+
+### 5. NoParamsFlowUseCase — Reactive stream without parameters
+
+Ideal for observing global data that requires no filter.
+
+```kotlin
+class ObserveNotifications(
+    private val notificationRepository: NotificationRepository,
+) : NoParamsFlowUseCase<List<Notification>> {
+
+    override fun invoke(): Flow<DomainResult<List<Notification>>> {
+        return notificationRepository.observeAll()
+    }
+}
+
+// Usage:
+observeNotifications()
+    .collect { result ->
+        result.onSuccess { notifications -> updateBadge(notifications.size) }
+    }
+```
+
+### Decision diagram
+
+```mermaid
+flowchart TD
+    A["What type of use case do I need?"] --> B{"Does it need I/O?"}
+    B -->|"No — pure calculation"| C["PureUseCase"]
+    B -->|"Yes"| D{"Returns a stream?"}
+    D -->|"No — single value"| E{"Needs parameters?"}
+    D -->|"Yes — multiple values"| F{"Needs parameters?"}
+    E -->|"Yes"| G["SuspendUseCase"]
+    E -->|"No"| H["NoParamsUseCase"]
+    F -->|"Yes"| I["FlowUseCase"]
+    F -->|"No"| J["NoParamsFlowUseCase"]
+
+    style C fill:#4CAF50,color:#fff
+    style G fill:#2196F3,color:#fff
+    style H fill:#2196F3,color:#fff
+    style I fill:#9C27B0,color:#fff
+    style J fill:#9C27B0,color:#fff
 ```
 
 ---
