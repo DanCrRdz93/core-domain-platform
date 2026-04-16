@@ -34,7 +34,10 @@ fun clockAt(millis: Long): ClockProvider = ClockProvider { millis }
 /** A [ClockProvider] that advances by [stepMillis] on each call starting at [startMillis]. */
 fun advancingClock(startMillis: Long = TEST_NOW_MILLIS, stepMillis: Long = 1_000L): ClockProvider {
     var current = startMillis - stepMillis
-    return ClockProvider { (current += stepMillis); current }
+    return ClockProvider {
+        current += stepMillis
+        current
+    }
 }
 
 // ── IdProvider doubles ────────────────────────────────────────────────────────

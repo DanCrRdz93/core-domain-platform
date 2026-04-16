@@ -48,11 +48,11 @@ class DomainModuleTest {
 
     // ── Feature DomainModule contract ─────────────────────────────────────────
 
-    interface WidgetDomainModule : DomainModule {
+    private interface WidgetDomainModule : DomainModule {
         val createWidget: SuspendUseCase<CreateWidgetParams, Widget>
     }
 
-    class WidgetDomainModuleImpl(
+    private class WidgetDomainModuleImpl(
         deps: DomainDependencies,
         widgetRepository: WidgetRepository,
     ) : WidgetDomainModule {
