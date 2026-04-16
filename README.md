@@ -1,7 +1,7 @@
 # Core Domain Platform SDK
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
-![Kotlin](https://img.shields.io/badge/Kotlin-2.0.21-purple)
+![Kotlin](https://img.shields.io/badge/Kotlin-2.1.20-purple)
 ![Platform](https://img.shields.io/badge/platform-JVM%20%7C%20Android%20%7C%20iOS-green)
 
 > **Idioma / Language:** 🇪🇸 [Español](#tabla-de-contenidos) (predeterminado) · 🇺🇸 [English](#english-version)
@@ -12,8 +12,8 @@ y Clean Architecture forzada a nivel del compilador.
 
 ```
 Targets: JVM · Android · iOS (arm64, x64, simulator)
-Lenguaje: Kotlin 2.0 · KMP
-Dependencias: kotlinx-coroutines-core (única)
+Lenguaje: Kotlin 2.1.20 · KMP
+Dependencias: kotlinx-coroutines-core 1.10.1 (única)
 ```
 
 ---
@@ -26,6 +26,7 @@ Dependencias: kotlinx-coroutines-core (única)
 - [Componentes Principales](#componentes-principales)
 - [DomainDependencies](#domaindependencies--el-contenedor-de-infraestructura-del-dominio)
 - [Referencia Completa de Casos de Uso](#referencia-completa-de-casos-de-uso)
+- [Integración con Core Data Platform](#integración-con-core-data-platform)
 - [Guía de Implementación Paso a Paso](#guía-de-implementación-paso-a-paso)
 - [Guía de Integración Android](#guía-de-integración-android)
 - [Guía de Integración iOS](#guía-de-integración-ios)
@@ -622,6 +623,144 @@ flowchart TD
 
 ---
 
+## Integración con Core Data Platform
+
+El **Core Domain Platform** (este SDK) define los contratos del dominio. El **[Core Data Platform](https://github.com/DanCrRdz93/core-data-platform)** implementa el acceso a datos remotos (HTTP, seguridad, sesiones). Ambos son KMP y están **100% alineados** en versiones:
+
+| | Domain SDK | Data SDK |
+|---|---|---|
+| Kotlin | 2.1.20 | 2.1.20 |
+| Coroutines | 1.10.1 | 1.10.1 |
+| Gradle | 9.3.1 | 9.3.1 |
+
+### Arquitectura completa
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                        TU APP (Android/iOS)                      │
+│                                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                      │
+│  │Feature A │  │Feature B │  │Feature C │  ← ViewModels         │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                      │
+│       │              │              │                            │
+│  ┌────▼──────────────▼──────────────▼────┐                      │
+│  │     Domain Use Cases (este SDK)       │                      │
+│  │  PureUseCase · SuspendUseCase · Flow  │                      │
+│  └────┬──────────────┬──────────────┬────┘                      │
+│       │              │              │                            │
+│  ┌────▼──────────────▼──────────────▼────┐                      │
+│  │   Repository / Gateway Implementations│  ← TÚ LOS ESCRIBES  │
+│  │   (puente entre ambos SDKs)           │                      │
+│  └────┬──────────────┬──────────────┬────┘                      │
+│       │              │              │                            │
+│  ┌────▼────┐  ┌──────▼─────┐  ┌────▼──────────┐                │
+│  │network  │  │ network    │  │  security     │  ← Data SDK    │
+│  │ -core   │  │  -ktor     │  │   -core       │                │
+│  └─────────┘  └────────────┘  └───────────────┘                │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 1. Mapeo de errores: `NetworkError` → `DomainError`
+
+```kotlin
+// Extensión que vive en tu capa de datos (NO en ninguno de los dos SDKs)
+fun NetworkError.toDomainError(): DomainError = when (this) {
+    is NetworkError.Connectivity -> DomainError.Infrastructure("Sin conexión a internet", this)
+    is NetworkError.Timeout      -> DomainError.Infrastructure("Tiempo de espera agotado", this)
+    is NetworkError.Authentication -> DomainError.Unauthorized("Autenticación requerida")
+    is NetworkError.Authorization  -> DomainError.Unauthorized("Acceso denegado")
+    is NetworkError.ClientError -> when (statusCode) {
+        404 -> DomainError.NotFound("Recurso", diagnostic?.detail ?: "")
+        409 -> DomainError.Conflict(message)
+        422 -> DomainError.Validation("request", message)
+        else -> DomainError.Infrastructure("Error HTTP $statusCode", this)
+    }
+    is NetworkError.ServerError    -> DomainError.Infrastructure("Error del servidor ($statusCode)", this)
+    is NetworkError.Serialization  -> DomainError.Infrastructure("Error al procesar respuesta", this)
+    is NetworkError.ResponseValidation -> DomainError.Infrastructure(reason, this)
+    is NetworkError.Cancelled      -> DomainError.Infrastructure("Solicitud cancelada", this)
+    is NetworkError.Unknown        -> DomainError.Unknown(message, this)
+}
+```
+
+### 2. Implementación de un Repository (el puente)
+
+```kotlin
+class UserRepositoryImpl(
+    private val dataSource: UserRemoteDataSource,      // ← Data SDK
+    private val mapper: Mapper<UserDto, User>,          // ← Domain SDK contrato
+) : ReadRepository<UserId, User> {                      // ← Domain SDK contrato
+
+    override suspend fun findById(id: UserId): DomainResult<User?> {
+        val networkResult = dataSource.getUser(id.value)
+        return networkResult.fold(
+            onSuccess = { dto -> mapper.map(dto).asSuccess() },
+            onFailure = { error -> domainFailure(error.toDomainError()) },
+        )
+    }
+}
+```
+
+### 3. Adaptador de sesión: `SessionController` → `NoParamsFlowGateway`
+
+```kotlin
+class SessionStateGateway(
+    private val sessionController: SessionController,   // ← Data SDK
+) : NoParamsFlowGateway<Boolean> {                      // ← Domain SDK contrato
+
+    override fun observe(): Flow<DomainResult<Boolean>> =
+        sessionController.state.map { state ->
+            (state is SessionState.Active).asSuccess()
+        }
+}
+```
+
+### 4. Wiring completo en la app
+
+```kotlin
+// Application.onCreate o AppDelegate — punto de ensamblaje
+fun provideAppDependencies(): AppDependencies {
+    // ── Domain SDK ──
+    val domainDeps = DomainDependencies(
+        clock = ClockProvider { System.currentTimeMillis() },
+        idProvider = IdProvider { UUID.randomUUID().toString() },
+    )
+
+    // ── Data SDK ──
+    val networkConfig = NetworkConfig(baseUrl = "https://api.example.com")
+    val httpEngine = KtorHttpEngine(networkConfig)
+    val executor = SafeRequestExecutor(httpEngine, retryPolicy, observer)
+
+    // ── Puente: DataSources + Repositories ──
+    val userDataSource = UserRemoteDataSource(executor)
+    val userMapper = Mapper<UserDto, User> { dto ->
+        User(id = UserId(dto.id), name = dto.displayName, email = dto.email)
+    }
+    val userRepo = UserRepositoryImpl(userDataSource, userMapper)
+
+    // ── Use Cases (Domain SDK) ──
+    val getUser = GetUserUseCase(userRepo)
+    val createUser = CreateUserUseCase(domainDeps, userRepo, nameValidator)
+
+    return AppDependencies(getUser, createUser, /* ... */)
+}
+```
+
+### Tabla de correspondencia completa
+
+| Data SDK | Domain SDK | Dónde se conectan |
+|---|---|---|
+| `NetworkResult<T>` | `DomainResult<T>` | Repository impl con `fold` |
+| `NetworkError.*` (9 subtipos) | `DomainError.*` (6 subtipos) | `NetworkError.toDomainError()` |
+| `ResponseMetadata` | `ResultMetadata` / `DomainResultWithMeta` | Repository impl (opcional) |
+| `UserRemoteDataSource` | `ReadRepository<UserId, User>` | Repository impl |
+| `SessionController.state` | `NoParamsFlowGateway<T>` | Adapter class |
+| `SessionController.startSession` | `CommandGateway<SessionCredentials>` | Adapter class |
+| DTOs (`@Serializable`) | Domain models (puros) | `Mapper<Dto, Model>` |
+| Batch HTTP requests | `WriteRepository.saveAll()` | Repository impl override |
+
+---
+
 ## Guía de Implementación Paso a Paso
 
 Esta guía te lleva paso a paso a través de la integración del SDK en un proyecto KMP nuevo o existente.
@@ -991,8 +1130,8 @@ and Clean Architecture enforced at the compiler level.
 
 ```
 Targets: JVM · Android · iOS (arm64, x64, simulator)
-Language: Kotlin 2.0 · KMP
-Dependencies: kotlinx-coroutines-core (only)
+Language: Kotlin 2.1.20 · KMP
+Dependencies: kotlinx-coroutines-core 1.10.1 (only)
 ```
 
 ---
@@ -1558,6 +1697,144 @@ flowchart TD
     style I fill:#9C27B0,color:#fff
     style J fill:#9C27B0,color:#fff
 ```
+
+---
+
+## Integration with Core Data Platform
+
+The **Core Domain Platform** (this SDK) defines domain contracts. The **[Core Data Platform](https://github.com/DanCrRdz93/core-data-platform)** implements remote data access (HTTP, security, sessions). Both are KMP and **100% version-aligned**:
+
+| | Domain SDK | Data SDK |
+|---|---|---|
+| Kotlin | 2.1.20 | 2.1.20 |
+| Coroutines | 1.10.1 | 1.10.1 |
+| Gradle | 9.3.1 | 9.3.1 |
+
+### Full Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      YOUR APP (Android/iOS)                      │
+│                                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                      │
+│  │Feature A │  │Feature B │  │Feature C │  ← ViewModels         │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                      │
+│       │              │              │                            │
+│  ┌────▼──────────────▼──────────────▼────┐                      │
+│  │     Domain Use Cases (this SDK)       │                      │
+│  │  PureUseCase · SuspendUseCase · Flow  │                      │
+│  └────┬──────────────┬──────────────┬────┘                      │
+│       │              │              │                            │
+│  ┌────▼──────────────▼──────────────▼────┐                      │
+│  │   Repository / Gateway Implementations│  ← YOU WRITE THESE   │
+│  │   (bridge between both SDKs)          │                      │
+│  └────┬──────────────┬──────────────┬────┘                      │
+│       │              │              │                            │
+│  ┌────▼────┐  ┌──────▼─────┐  ┌────▼──────────┐                │
+│  │network  │  │ network    │  │  security     │  ← Data SDK    │
+│  │ -core   │  │  -ktor     │  │   -core       │                │
+│  └─────────┘  └────────────┘  └───────────────┘                │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 1. Error mapping: `NetworkError` → `DomainError`
+
+```kotlin
+// Extension living in your data layer (NOT in either SDK)
+fun NetworkError.toDomainError(): DomainError = when (this) {
+    is NetworkError.Connectivity -> DomainError.Infrastructure("No internet connection", this)
+    is NetworkError.Timeout      -> DomainError.Infrastructure("Request timed out", this)
+    is NetworkError.Authentication -> DomainError.Unauthorized("Authentication required")
+    is NetworkError.Authorization  -> DomainError.Unauthorized("Access denied")
+    is NetworkError.ClientError -> when (statusCode) {
+        404 -> DomainError.NotFound("Resource", diagnostic?.detail ?: "")
+        409 -> DomainError.Conflict(message)
+        422 -> DomainError.Validation("request", message)
+        else -> DomainError.Infrastructure("HTTP error $statusCode", this)
+    }
+    is NetworkError.ServerError    -> DomainError.Infrastructure("Server error ($statusCode)", this)
+    is NetworkError.Serialization  -> DomainError.Infrastructure("Failed to process response", this)
+    is NetworkError.ResponseValidation -> DomainError.Infrastructure(reason, this)
+    is NetworkError.Cancelled      -> DomainError.Infrastructure("Request cancelled", this)
+    is NetworkError.Unknown        -> DomainError.Unknown(message, this)
+}
+```
+
+### 2. Repository implementation (the bridge)
+
+```kotlin
+class UserRepositoryImpl(
+    private val dataSource: UserRemoteDataSource,      // ← Data SDK
+    private val mapper: Mapper<UserDto, User>,          // ← Domain SDK contract
+) : ReadRepository<UserId, User> {                      // ← Domain SDK contract
+
+    override suspend fun findById(id: UserId): DomainResult<User?> {
+        val networkResult = dataSource.getUser(id.value)
+        return networkResult.fold(
+            onSuccess = { dto -> mapper.map(dto).asSuccess() },
+            onFailure = { error -> domainFailure(error.toDomainError()) },
+        )
+    }
+}
+```
+
+### 3. Session adapter: `SessionController` → `NoParamsFlowGateway`
+
+```kotlin
+class SessionStateGateway(
+    private val sessionController: SessionController,   // ← Data SDK
+) : NoParamsFlowGateway<Boolean> {                      // ← Domain SDK contract
+
+    override fun observe(): Flow<DomainResult<Boolean>> =
+        sessionController.state.map { state ->
+            (state is SessionState.Active).asSuccess()
+        }
+}
+```
+
+### 4. Full wiring in the app
+
+```kotlin
+// Application.onCreate or AppDelegate — assembly point
+fun provideAppDependencies(): AppDependencies {
+    // ── Domain SDK ──
+    val domainDeps = DomainDependencies(
+        clock = ClockProvider { System.currentTimeMillis() },
+        idProvider = IdProvider { UUID.randomUUID().toString() },
+    )
+
+    // ── Data SDK ──
+    val networkConfig = NetworkConfig(baseUrl = "https://api.example.com")
+    val httpEngine = KtorHttpEngine(networkConfig)
+    val executor = SafeRequestExecutor(httpEngine, retryPolicy, observer)
+
+    // ── Bridge: DataSources + Repositories ──
+    val userDataSource = UserRemoteDataSource(executor)
+    val userMapper = Mapper<UserDto, User> { dto ->
+        User(id = UserId(dto.id), name = dto.displayName, email = dto.email)
+    }
+    val userRepo = UserRepositoryImpl(userDataSource, userMapper)
+
+    // ── Use Cases (Domain SDK) ──
+    val getUser = GetUserUseCase(userRepo)
+    val createUser = CreateUserUseCase(domainDeps, userRepo, nameValidator)
+
+    return AppDependencies(getUser, createUser, /* ... */)
+}
+```
+
+### Full correspondence table
+
+| Data SDK | Domain SDK | Where they connect |
+|---|---|---|
+| `NetworkResult<T>` | `DomainResult<T>` | Repository impl via `fold` |
+| `NetworkError.*` (9 subtypes) | `DomainError.*` (6 subtypes) | `NetworkError.toDomainError()` |
+| `ResponseMetadata` | `ResultMetadata` / `DomainResultWithMeta` | Repository impl (optional) |
+| `UserRemoteDataSource` | `ReadRepository<UserId, User>` | Repository impl |
+| `SessionController.state` | `NoParamsFlowGateway<T>` | Adapter class |
+| `SessionController.startSession` | `CommandGateway<SessionCredentials>` | Adapter class |
+| DTOs (`@Serializable`) | Domain models (pure) | `Mapper<Dto, Model>` |
+| Batch HTTP requests | `WriteRepository.saveAll()` | Repository impl override |
 
 ---
 
