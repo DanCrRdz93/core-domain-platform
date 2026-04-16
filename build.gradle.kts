@@ -1,9 +1,7 @@
 plugins {
     kotlin("multiplatform") version "2.1.20"
+    id("com.vanniktech.maven.publish") version "0.35.0"
 }
-
-group = "com.domain.core"
-version = "1.0.0"
 
 kotlin {
     jvm()
