@@ -1,6 +1,6 @@
 # Core Domain Platform SDK
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Maven Central](https://img.shields.io/maven-central/v/io.github.dancrrdz93/coredomainplatform)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.1.20-purple)
 ![Platform](https://img.shields.io/badge/platform-JVM%20%7C%20Android%20%7C%20iOS-green)
 
@@ -20,6 +20,7 @@ Dependencias: kotlinx-coroutines-core 1.10.1 (única)
 
 ## Tabla de Contenidos
 
+- [Instalación](#instalación)
 - [¿Por qué este SDK?](#por-qué-este-sdk)
 - [Vista General de Arquitectura](#vista-general-de-arquitectura)
 - [Estructura de Paquetes](#estructura-de-paquetes)
@@ -33,6 +34,43 @@ Dependencias: kotlinx-coroutines-core 1.10.1 (única)
 - [Referencia de Manejo de Errores](#referencia-de-manejo-de-errores)
 - [Estrategia de Testing](#estrategia-de-testing)
 - [Versionado](#versionado)
+
+---
+
+## Instalación
+
+### Kotlin DSL (build.gradle.kts)
+
+```kotlin
+dependencies {
+    implementation("io.github.dancrrdz93:coredomainplatform:1.0.0")
+}
+```
+
+### Groovy DSL (build.gradle)
+
+```groovy
+dependencies {
+    implementation 'io.github.dancrrdz93:coredomainplatform:1.0.0'
+}
+```
+
+### Version Catalog (libs.versions.toml)
+
+```toml
+[versions]
+coreDomainPlatform = "1.0.0"
+
+[libraries]
+core-domain-platform = { group = "io.github.dancrrdz93", name = "coredomainplatform", version.ref = "coreDomainPlatform" }
+```
+
+```kotlin
+// build.gradle.kts
+dependencies {
+    implementation(libs.core.domain.platform)
+}
+```
 
 ---
 
@@ -2533,7 +2571,7 @@ Consulta [ARCHITECTURE.md](ARCHITECTURE.md) para principios de diseño e
 
 ## Licencia
 
-Repositorio privado. Todos los derechos reservados.
+Apache License 2.0 — ver [LICENSE](LICENSE).
 
 ---
 
@@ -2548,6 +2586,43 @@ and Clean Architecture enforced at the compiler level.
 Targets: JVM · Android · iOS (arm64, x64, simulator)
 Language: Kotlin 2.1.20 · KMP
 Dependencies: kotlinx-coroutines-core 1.10.1 (only)
+```
+
+---
+
+## Installation
+
+### Kotlin DSL (build.gradle.kts)
+
+```kotlin
+dependencies {
+    implementation("io.github.dancrrdz93:coredomainplatform:1.0.0")
+}
+```
+
+### Groovy DSL (build.gradle)
+
+```groovy
+dependencies {
+    implementation 'io.github.dancrrdz93:coredomainplatform:1.0.0'
+}
+```
+
+### Version Catalog (libs.versions.toml)
+
+```toml
+[versions]
+coreDomainPlatform = "1.0.0"
+
+[libraries]
+core-domain-platform = { group = "io.github.dancrrdz93", name = "coredomainplatform", version.ref = "coreDomainPlatform" }
+```
+
+```kotlin
+// build.gradle.kts
+dependencies {
+    implementation(libs.core.domain.platform)
+}
 ```
 
 ---
@@ -5025,6 +5100,6 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design principles and
 
 ## License
 
-Private repository. All rights reserved.
+Apache License 2.0 — see [LICENSE](LICENSE).
 
 </details>
