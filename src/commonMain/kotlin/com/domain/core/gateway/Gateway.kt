@@ -1,6 +1,7 @@
 package com.domain.core.gateway
 
 import com.domain.core.result.DomainResult
+import kotlinx.coroutines.flow.Flow
 
 /**
  * Marker interface for domain gateway contracts.
@@ -44,4 +45,33 @@ public interface SuspendGateway<in I, out O> : Gateway {
  */
 public interface CommandGateway<in I> : Gateway {
     public suspend fun dispatch(input: I): DomainResult<Unit>
+}
+
+/**
+ * Gateway contract for capabilities that produce a reactive stream of results.
+ *
+ * [I] — the input / subscription parameter.
+ * [O] — the output emitted over time.
+ *
+ * Design rationale:
+ * - [SuspendGateway] produces a single value; [FlowGateway] produces many.
+ *   Keeping them separate makes call-site intent explicit: "one value" vs "stream".
+ * - Typical consumers: WebSocket feeds, SSE streams, [SessionController.state]
+ *   from the data SDK, real-time price tickers, connectivity monitors.
+ * - Each emission is wrapped in [DomainResult] so that transient errors
+ *   can be reported without cancelling the stream.
+ */
+public interface FlowGateway<in I, out O> : Gateway {
+    public fun observe(input: I): Flow<DomainResult<O>>
+}
+
+/**
+ * No-params variant of [FlowGateway] — observe a global stream that
+ * requires no subscription parameter.
+ *
+ * Typical consumers: session state changes, connectivity status,
+ * unread notification count.
+ */
+public interface NoParamsFlowGateway<out O> : Gateway {
+    public fun observe(): Flow<DomainResult<O>>
 }
