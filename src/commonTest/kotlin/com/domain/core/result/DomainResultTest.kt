@@ -251,4 +251,26 @@ class DomainResultTest {
         assertEquals("User", extracted.resourceType)
         assertEquals("99", extracted.id)
     }
+
+    // ── fold ─────────────────────────────────────────────────────────────────
+
+    @Test
+    fun `fold returns onSuccess branch for Success`() {
+        val result: DomainResult<String> = "hello".asSuccess()
+        val output = result.fold(
+            onSuccess = { "got: $it" },
+            onFailure = { "error" },
+        )
+        assertEquals("got: hello", output)
+    }
+
+    @Test
+    fun `fold returns onFailure branch for Failure`() {
+        val result: DomainResult<String> = domainFailure(DomainError.NotFound("User", "1"))
+        val output = result.fold(
+            onSuccess = { "got: $it" },
+            onFailure = { "error: ${it.message}" },
+        )
+        assertEquals("error: Resource 'User' with id '1' not found.", output)
+    }
 }

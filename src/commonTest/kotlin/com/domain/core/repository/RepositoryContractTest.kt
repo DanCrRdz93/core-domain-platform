@@ -80,4 +80,32 @@ class RepositoryContractTest {
         val found = repo.findById("1").shouldBeSuccess()
         assertEquals(null, found)
     }
+
+    // ── saveAll / deleteAll default implementations ─────────────────────────────
+
+    @Test
+    fun `saveAll persists all entities`() = runTest {
+        val repo = InMemoryWidgetRepo()
+        repo.saveAll(listOf(Widget("1", "Gear"), Widget("2", "Bolt"), Widget("3", "Nut")))
+        val all = repo.findAll().shouldBeSuccess()
+        assertEquals(3, all.size)
+    }
+
+    @Test
+    fun `saveAll on empty list is a no-op success`() = runTest {
+        val repo = InMemoryWidgetRepo()
+        val result = repo.saveAll(emptyList()).shouldBeSuccess()
+        assertEquals(Unit, result)
+    }
+
+    @Test
+    fun `deleteAll removes all specified entities`() = runTest {
+        val repo = InMemoryWidgetRepo()
+        val w1 = Widget("1", "Gear")
+        val w2 = Widget("2", "Bolt")
+        repo.saveAll(listOf(w1, w2))
+        repo.deleteAll(listOf(w1, w2))
+        val all = repo.findAll().shouldBeSuccess()
+        assertEquals(0, all.size)
+    }
 }

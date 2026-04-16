@@ -1,6 +1,7 @@
 package com.domain.core.repository
 
 import com.domain.core.result.DomainResult
+import com.domain.core.result.asSuccess
 import com.domain.core.result.map
 import kotlinx.coroutines.flow.Flow
 
@@ -52,11 +53,35 @@ public interface ReadCollectionRepository<out T> : Repository {
 
 /**
  * Contract for repositories that support write operations.
+ *
+ * Design rationale:
+ * - [saveAll] and [deleteAll] have default implementations that loop over
+ *   the individual operations. Override them when the data layer supports
+ *   batch operations (e.g., bulk INSERT, batch HTTP request) for better
+ *   performance.
+ * - Default implementations are fail-fast: they stop at the first failure.
+ *
  * [T] — the aggregate root type.
  */
 public interface WriteRepository<in T> : Repository {
     public suspend fun save(entity: T): DomainResult<Unit>
     public suspend fun delete(entity: T): DomainResult<Unit>
+
+    public suspend fun saveAll(entities: List<T>): DomainResult<Unit> {
+        for (entity in entities) {
+            val result = save(entity)
+            if (result.isFailure) return result
+        }
+        return Unit.asSuccess()
+    }
+
+    public suspend fun deleteAll(entities: List<T>): DomainResult<Unit> {
+        for (entity in entities) {
+            val result = delete(entity)
+            if (result.isFailure) return result
+        }
+        return Unit.asSuccess()
+    }
 }
 
 /**

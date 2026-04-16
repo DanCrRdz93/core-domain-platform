@@ -71,6 +71,22 @@ public inline fun <T> DomainResult<T>.onFailure(action: (DomainError) -> Unit): 
     return this
 }
 
+/**
+ * Exhaustively handles both branches and returns a single value.
+ *
+ * Design rationale:
+ * - Mirrors `NetworkResult.fold` from the data SDK, making the bridge pattern
+ *   consistent: `networkResult.fold(...)` → `domainResult.fold(...)`.
+ * - Forces the caller to handle both cases — no forgotten failure branch.
+ */
+public inline fun <T, R> DomainResult<T>.fold(
+    onSuccess: (T) -> R,
+    onFailure: (DomainError) -> R,
+): R = when (this) {
+    is DomainResult.Success -> onSuccess(value)
+    is DomainResult.Failure -> onFailure(error)
+}
+
 // ── Combination ──────────────────────────────────────────────────────────────
 
 /**
