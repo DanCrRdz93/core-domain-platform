@@ -1,5 +1,9 @@
 # Core Domain Platform SDK
 
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Kotlin](https://img.shields.io/badge/Kotlin-2.0.21-purple)
+![Platform](https://img.shields.io/badge/platform-JVM%20%7C%20Android%20%7C%20iOS-green)
+
 A **pure domain layer SDK** for Kotlin Multiplatform. Zero framework dependencies.
 Zero infrastructure. Zero UI. Just typed contracts, functional error handling,
 and Clean Architecture enforced at the compiler level.
