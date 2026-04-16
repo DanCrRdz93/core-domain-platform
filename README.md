@@ -131,6 +131,7 @@ com.domain.core/
 ├── usecase/       → PureUseCase, SuspendUseCase, FlowUseCase, NoParams*
 ├── repository/    → Repository, ReadRepository, WriteRepository, ReadCollectionRepository
 ├── gateway/       → Gateway, SuspendGateway, CommandGateway
+├── streaming/     → ConnectionState, StreamingConnection, StreamingGateway
 ├── validation/    → Validator<T>, andThen, validateAll, collectValidationErrors
 ├── policy/        → DomainPolicy, SuspendDomainPolicy, and/or/negate
 └── provider/      → ClockProvider, IdProvider
@@ -1818,6 +1819,328 @@ val executor = DefaultSafeRequestExecutor(
 
 Puedes combinar cualquier cantidad de observers — no se interfieren entre sí.
 
+### 11. Mapeo de errores WebSocket: `WebSocketError` → `DomainError`
+
+#### El problema
+
+El Data SDK ahora incluye módulos de WebSocket (`network-ws-core`, `network-ws-ktor`).
+Cuando una conexión WebSocket falla, retorna `WebSocketError` (8 subtipos). Necesitas
+un mapeo similar al de `NetworkError.toDomainError()`.
+
+#### Estructura de `WebSocketError`
+
+```
+WebSocketError (Data SDK)
+    ├── ConnectionFailed   (isRetryable = true)   — no se pudo conectar
+    ├── ConnectionLost     (isRetryable = true)   — conexión perdida durante uso
+    ├── Timeout            (isRetryable = true)   — timeout al conectar
+    ├── ProtocolError      (isRetryable = false)  — error de protocolo WebSocket
+    ├── ClosedByServer     (isRetryable = varies) — el servidor cerró la conexión
+    ├── Authentication     (isRetryable = false)  — 401/403 durante handshake
+    ├── Serialization      (isRetryable = false)  — frame no se pudo deserializar
+    └── Unknown            (isRetryable = false)  — catch-all
+```
+
+#### Implementación
+
+```kotlin
+// Extensión en tu capa de datos (NO en ninguno de los SDKs)
+fun WebSocketError.toDomainError(): DomainError = when (this) {
+    // ── Conexión ──
+    is WebSocketError.ConnectionFailed -> DomainError.Infrastructure(
+        detail = "No se pudo conectar al servidor",
+        cause = diagnostic?.cause,
+    )
+    is WebSocketError.ConnectionLost -> DomainError.Infrastructure(
+        detail = "Conexión perdida",
+        cause = diagnostic?.cause,
+    )
+    is WebSocketError.Timeout -> DomainError.Infrastructure(
+        detail = "Timeout al conectar",
+        cause = diagnostic?.cause,
+    )
+
+    // ── Protocolo ──
+    is WebSocketError.ProtocolError -> DomainError.Infrastructure(
+        detail = "Error de protocolo: $message",
+        cause = diagnostic?.cause,
+    )
+    is WebSocketError.ClosedByServer -> DomainError.Infrastructure(
+        detail = "Servidor cerró la conexión (código: $code)",
+        cause = diagnostic?.cause,
+    )
+
+    // ── Seguridad ──
+    is WebSocketError.Authentication -> DomainError.Unauthorized(
+        detail = "Autenticación requerida para WebSocket",
+    )
+
+    // ── Procesamiento ──
+    is WebSocketError.Serialization -> DomainError.Infrastructure(
+        detail = "Error al procesar mensaje del stream",
+        cause = diagnostic?.cause,
+    )
+
+    // ── Catch-all ──
+    is WebSocketError.Unknown -> DomainError.Unknown(
+        detail = message,
+        cause = diagnostic?.cause,
+    )
+}
+```
+
+### 12. Mapeo de errores de seguridad: `SecurityError` → `DomainError`
+
+#### El problema
+
+El módulo `security-core` del Data SDK define `SecurityError` (6 subtipos) para
+errores de sesión y almacenamiento seguro. Los gateways de sesión (Gap 6) que usan
+`runDomainCatching` capturan excepciones genéricas, pero para un mapeo semántico
+correcto necesitas mapear `SecurityError` explícitamente.
+
+#### Estructura de `SecurityError`
+
+```
+SecurityError (Data SDK)
+    ├── TokenExpired               — el token de sesión expiró
+    ├── TokenRefreshFailed         — no se pudo renovar el token
+    ├── InvalidCredentials         — usuario/contraseña incorrectos
+    ├── SecureStorageFailure       — Keychain/Keystore falló
+    ├── CertificatePinningFailure  — el certificado no coincide con los pins
+    └── Unknown                    — catch-all
+```
+
+#### Implementación
+
+```kotlin
+fun SecurityError.toDomainError(): DomainError = when (this) {
+    is SecurityError.TokenExpired -> DomainError.Unauthorized(
+        detail = "Sesión expirada",
+    )
+    is SecurityError.TokenRefreshFailed -> DomainError.Unauthorized(
+        detail = "No se pudo renovar la sesión",
+    )
+    is SecurityError.InvalidCredentials -> DomainError.Unauthorized(
+        detail = "Credenciales inválidas",
+    )
+    is SecurityError.SecureStorageFailure -> DomainError.Infrastructure(
+        detail = "Error de almacenamiento seguro",
+        cause = diagnostic?.cause,
+    )
+    is SecurityError.CertificatePinningFailure -> DomainError.Infrastructure(
+        detail = "Certificado no confiable para $host",
+        cause = diagnostic?.cause,
+    )
+    is SecurityError.Unknown -> DomainError.Unknown(
+        detail = message,
+        cause = diagnostic?.cause,
+    )
+}
+```
+
+#### Uso en los gateways de sesión
+
+```kotlin
+class LoginGateway(
+    private val session: SessionController,
+) : CommandGateway<SessionCredentials> {
+
+    override suspend fun dispatch(input: SessionCredentials): DomainResult<Unit> =
+        runDomainCatching(
+            errorMapper = { throwable ->
+                // Si el Data SDK lanza SecurityError como excepción
+                (throwable as? SecurityError)?.toDomainError()
+                    ?: DomainError.Unknown(cause = throwable)
+            }
+        ) {
+            session.startSession(input)
+        }
+}
+```
+
+### 13. Integración con WebSocket — Streaming en tiempo real
+
+#### El problema
+
+Muchas apps necesitan datos en tiempo real: precios de criptomonedas, chat, notificaciones
+push, scores en vivo. El Data SDK ahora tiene soporte completo de WebSocket con:
+
+- `SafeWebSocketExecutor` — gestiona conexión, reconexión y clasificación de errores
+- `WebSocketConnection` — exposición reactiva del stream con `state` y `incoming`
+- `StreamingDataSource` — clase abstracta para data sources basados en WebSocket
+
+El Domain SDK ahora incluye contratos de streaming para dar soporte completo:
+
+```
+Domain SDK (nuevos contratos)
+    ├── ConnectionState         — Connected / Connecting(attempt) / Disconnected(error?)
+    ├── StreamingConnection<T>  — state + incoming + close
+    ├── BidirectionalStreamingConnection<S, T>  — extends con send(message)
+    ├── StreamingGateway<I, O>  — connect(input): StreamingConnection<O>
+    ├── NoParamsStreamingGateway<O>  — connect(): StreamingConnection<O>
+    └── BidirectionalStreamingGateway<I, S, O>  — connect(input): BidirectionalStreamingConnection<S, O>
+```
+
+#### El flujo paso a paso
+
+```
+1. ViewModel llama: priceStreamGateway.connect("BTC-USD")
+   │  Recibe: StreamingConnection<PriceTick>
+        │
+        ▼
+2. PriceStreamGatewayImpl.connect("BTC-USD")
+   │  Crea: WebSocketRequest(path = "/ws/prices/BTC-USD")
+   │  Llama: dataSource.connect("BTC-USD") → WebSocketConnection
+   │  Envuelve en: DomainStreamingConnectionAdapter
+        │
+        ▼
+3. Data SDK abre conexión WebSocket
+   │  wss://api.example.com/ws/prices/BTC-USD
+   │  WebSocketState → Connecting(0) → Connected
+        │
+        ▼
+4. ConnectionState se mapea automáticamente:
+   │  WebSocketState.Connecting(0) → ConnectionState.Connecting(0)
+   │  WebSocketState.Connected     → ConnectionState.Connected
+        │
+        ▼
+5. Frames llegan del servidor:
+   │  WebSocketFrame.Text('{"price":42000.50}')
+   │    → deserializar → PriceTickDto
+   │    → mapper.map(dto) → PriceTick(price=42000.50)
+   │    → emitir: DomainResult.Success(PriceTick(42000.50))
+        │
+        ▼
+6. ViewModel observa:
+   │  connection.state.collect { ... }      ← para UI de estado de conexión
+   │  connection.incoming.collect { ... }   ← para datos en tiempo real
+```
+
+#### Implementación del adapter (puente)
+
+```kotlin
+class DomainStreamingConnectionAdapter<Dto, T>(
+    private val wsConnection: WebSocketConnection,
+    private val deserialize: (WebSocketFrame) -> Dto?,
+    private val mapper: Mapper<Dto, T>,
+    private val errorMapper: (WebSocketError) -> DomainError = { it.toDomainError() },
+) : StreamingConnection<T> {
+
+    // Mapea WebSocketState → ConnectionState
+    override val state: StateFlow<ConnectionState> =
+        wsConnection.state.map { wsState ->
+            when (wsState) {
+                is WebSocketState.Connecting -> ConnectionState.Connecting(wsState.attempt)
+                is WebSocketState.Connected -> ConnectionState.Connected
+                is WebSocketState.Disconnected -> ConnectionState.Disconnected(
+                    error = wsState.error?.let(errorMapper),
+                )
+            }
+        }.stateIn(/* scope */)
+
+    // Mapea WebSocketFrame → DomainResult<T>
+    override val incoming: Flow<DomainResult<T>> =
+        wsConnection.incoming.mapNotNull { frame ->
+            try {
+                val dto = deserialize(frame) ?: return@mapNotNull null
+                mapper.map(dto).asSuccess()
+            } catch (e: Exception) {
+                domainFailure(DomainError.Infrastructure("Error deserializando frame", e))
+            }
+        }
+
+    override suspend fun close() {
+        wsConnection.close()
+    }
+}
+```
+
+#### Implementación del gateway
+
+```kotlin
+// ── Contrato en el dominio ──
+interface PriceStreamGateway : StreamingGateway<String, PriceTick>
+
+// ── Implementación en la capa de datos ──
+class PriceStreamGatewayImpl(
+    private val dataSource: PriceStreamDataSource,
+    private val mapper: Mapper<PriceTickDto, PriceTick>,
+) : PriceStreamGateway {
+
+    override fun connect(input: String): StreamingConnection<PriceTick> =
+        DomainStreamingConnectionAdapter(
+            wsConnection = dataSource.connect(input),
+            deserialize = { frame ->
+                when (frame) {
+                    is WebSocketFrame.Text -> Json.decodeFromString(frame.text)
+                    else -> null
+                }
+            },
+            mapper = mapper,
+        )
+}
+```
+
+#### Uso en el ViewModel
+
+```kotlin
+class PriceViewModel(
+    private val priceStream: PriceStreamGateway,
+) : ViewModel() {
+
+    private var connection: StreamingConnection<PriceTick>? = null
+
+    fun startObserving(symbol: String) {
+        connection = priceStream.connect(symbol)
+
+        // Observar estado de conexión
+        viewModelScope.launch {
+            connection!!.state.collect { state ->
+                when (state) {
+                    is ConnectionState.Connecting -> _uiState.value = UiState.Reconnecting(state.attempt)
+                    is ConnectionState.Connected -> _uiState.value = UiState.Connected
+                    is ConnectionState.Disconnected -> _uiState.value = UiState.Disconnected(state.error?.message)
+                }
+            }
+        }
+
+        // Observar precios
+        viewModelScope.launch {
+            connection!!.incoming.collect { result ->
+                result.fold(
+                    onSuccess = { tick -> _price.value = tick },
+                    onFailure = { error -> _lastError.value = error.message },
+                )
+            }
+        }
+    }
+
+    override fun onCleared() {
+        viewModelScope.launch { connection?.close() }
+    }
+}
+```
+
+#### Chat bidireccional
+
+```kotlin
+// ── Contrato en el dominio ──
+interface ChatGateway : BidirectionalStreamingGateway<String, ChatMessage, ChatMessage>
+
+// ── Uso en el ViewModel ──
+val chatConnection = chatGateway.connect("room-42")
+
+// Recibir mensajes
+chatConnection.incoming.collect { result ->
+    result.onSuccess { msg -> addToChat(msg) }
+}
+
+// Enviar mensajes
+chatConnection.send(ChatMessage(text = "Hola!")).onFailure { error ->
+    showError("No se pudo enviar: ${error.message}")
+}
+```
+
 ### Tabla de correspondencia completa
 
 | Data SDK | Domain SDK | Dónde se conectan |
@@ -1841,6 +2164,14 @@ Puedes combinar cualquier cantidad de observers — no se interfieren entre sí.
 | `TrustPolicy` / `CertificatePin` | N/A (infra pura) | `KtorHttpEngine.create(config, trustPolicy)` |
 | `NetworkEventObserver` | N/A (infra pura) | `DefaultSafeRequestExecutor(observers = ...)` |
 | `LoggingObserver` | N/A (infra pura) | Configurado en el wiring |
+| `WebSocketConnection` | `StreamingConnection<T>` | `DomainStreamingConnectionAdapter` |
+| `WebSocketState` | `ConnectionState` | Mapeo en adapter: Connecting/Connected/Disconnected |
+| `WebSocketError.*` (8 subtipos) | `DomainError.*` (7 subtipos) | `WebSocketError.toDomainError()` |
+| `SafeWebSocketExecutor` | `StreamingGateway<I, O>` | Gateway impl con adapter |
+| `WebSocketFrame` | Tipo deserializado `T` | `Mapper<Dto, T>` en el adapter |
+| `ReconnectPolicy` | N/A (infra pura) | Configurado en `WebSocketConfig` |
+| `WebSocketEventObserver` | N/A (infra pura) | `DefaultSafeWebSocketExecutor(observers = ...)` |
+| `SecurityError.*` (6 subtipos) | `DomainError.*` (7 subtipos) | `SecurityError.toDomainError()` |
 | DTOs (`@Serializable`) | Domain models (puros) | `Mapper<Dto, Model>` |
 | Batch HTTP requests | `WriteRepository.saveAll()` | Repository impl override |
 
@@ -2316,6 +2647,7 @@ com.domain.core/
 ├── usecase/       → PureUseCase, SuspendUseCase, FlowUseCase, NoParams*
 ├── repository/    → Repository, ReadRepository, WriteRepository, ReadCollectionRepository
 ├── gateway/       → Gateway, SuspendGateway, CommandGateway
+├── streaming/     → ConnectionState, StreamingConnection, StreamingGateway
 ├── validation/    → Validator<T>, andThen, validateAll, collectValidationErrors
 ├── policy/        → DomainPolicy, SuspendDomainPolicy, and/or/negate
 └── provider/      → ClockProvider, IdProvider
@@ -3979,6 +4311,328 @@ val executor = DefaultSafeRequestExecutor(
 
 You can combine any number of observers — they don't interfere with each other.
 
+### 11. WebSocket error mapping: `WebSocketError` → `DomainError`
+
+#### The problem
+
+The Data SDK now includes WebSocket modules (`network-ws-core`, `network-ws-ktor`).
+When a WebSocket connection fails, it returns `WebSocketError` (8 subtypes). You need
+a mapping similar to `NetworkError.toDomainError()`.
+
+#### `WebSocketError` structure
+
+```
+WebSocketError (Data SDK)
+    ├── ConnectionFailed   (isRetryable = true)   — could not establish connection
+    ├── ConnectionLost     (isRetryable = true)   — connection lost during use
+    ├── Timeout            (isRetryable = true)   — connection timeout
+    ├── ProtocolError      (isRetryable = false)  — WebSocket protocol error
+    ├── ClosedByServer     (isRetryable = varies) — server closed the connection
+    ├── Authentication     (isRetryable = false)  — 401/403 during handshake
+    ├── Serialization      (isRetryable = false)  — frame deserialization failed
+    └── Unknown            (isRetryable = false)  — catch-all
+```
+
+#### Implementation
+
+```kotlin
+// Extension in your data layer (NOT in either SDK)
+fun WebSocketError.toDomainError(): DomainError = when (this) {
+    // ── Connection ──
+    is WebSocketError.ConnectionFailed -> DomainError.Infrastructure(
+        detail = "Could not connect to server",
+        cause = diagnostic?.cause,
+    )
+    is WebSocketError.ConnectionLost -> DomainError.Infrastructure(
+        detail = "Connection lost",
+        cause = diagnostic?.cause,
+    )
+    is WebSocketError.Timeout -> DomainError.Infrastructure(
+        detail = "Connection timeout",
+        cause = diagnostic?.cause,
+    )
+
+    // ── Protocol ──
+    is WebSocketError.ProtocolError -> DomainError.Infrastructure(
+        detail = "Protocol error: $message",
+        cause = diagnostic?.cause,
+    )
+    is WebSocketError.ClosedByServer -> DomainError.Infrastructure(
+        detail = "Server closed connection (code: $code)",
+        cause = diagnostic?.cause,
+    )
+
+    // ── Security ──
+    is WebSocketError.Authentication -> DomainError.Unauthorized(
+        detail = "Authentication required for WebSocket",
+    )
+
+    // ── Processing ──
+    is WebSocketError.Serialization -> DomainError.Infrastructure(
+        detail = "Failed to process stream message",
+        cause = diagnostic?.cause,
+    )
+
+    // ── Catch-all ──
+    is WebSocketError.Unknown -> DomainError.Unknown(
+        detail = message,
+        cause = diagnostic?.cause,
+    )
+}
+```
+
+### 12. Security error mapping: `SecurityError` → `DomainError`
+
+#### The problem
+
+The Data SDK's `security-core` module defines `SecurityError` (6 subtypes) for
+session and secure storage errors. The session gateways (Gap 6) that use
+`runDomainCatching` catch generic exceptions, but for correct semantic mapping
+you need to map `SecurityError` explicitly.
+
+#### `SecurityError` structure
+
+```
+SecurityError (Data SDK)
+    ├── TokenExpired               — session token has expired
+    ├── TokenRefreshFailed         — could not refresh the token
+    ├── InvalidCredentials         — wrong username/password
+    ├── SecureStorageFailure       — Keychain/Keystore failed
+    ├── CertificatePinningFailure  — certificate doesn't match pins
+    └── Unknown                    — catch-all
+```
+
+#### Implementation
+
+```kotlin
+fun SecurityError.toDomainError(): DomainError = when (this) {
+    is SecurityError.TokenExpired -> DomainError.Unauthorized(
+        detail = "Session expired",
+    )
+    is SecurityError.TokenRefreshFailed -> DomainError.Unauthorized(
+        detail = "Could not refresh session",
+    )
+    is SecurityError.InvalidCredentials -> DomainError.Unauthorized(
+        detail = "Invalid credentials",
+    )
+    is SecurityError.SecureStorageFailure -> DomainError.Infrastructure(
+        detail = "Secure storage error",
+        cause = diagnostic?.cause,
+    )
+    is SecurityError.CertificatePinningFailure -> DomainError.Infrastructure(
+        detail = "Untrusted certificate for $host",
+        cause = diagnostic?.cause,
+    )
+    is SecurityError.Unknown -> DomainError.Unknown(
+        detail = message,
+        cause = diagnostic?.cause,
+    )
+}
+```
+
+#### Usage in session gateways
+
+```kotlin
+class LoginGateway(
+    private val session: SessionController,
+) : CommandGateway<SessionCredentials> {
+
+    override suspend fun dispatch(input: SessionCredentials): DomainResult<Unit> =
+        runDomainCatching(
+            errorMapper = { throwable ->
+                // If the Data SDK throws SecurityError as an exception
+                (throwable as? SecurityError)?.toDomainError()
+                    ?: DomainError.Unknown(cause = throwable)
+            }
+        ) {
+            session.startSession(input)
+        }
+}
+```
+
+### 13. WebSocket integration — Real-time streaming
+
+#### The problem
+
+Many apps need real-time data: cryptocurrency prices, chat, push notifications,
+live scores. The Data SDK now has full WebSocket support with:
+
+- `SafeWebSocketExecutor` — manages connection, reconnection, and error classification
+- `WebSocketConnection` — reactive exposure of the stream with `state` and `incoming`
+- `StreamingDataSource` — abstract class for WebSocket-based data sources
+
+The Domain SDK now includes streaming contracts for full support:
+
+```
+Domain SDK (new contracts)
+    ├── ConnectionState         — Connected / Connecting(attempt) / Disconnected(error?)
+    ├── StreamingConnection<T>  — state + incoming + close
+    ├── BidirectionalStreamingConnection<S, T>  — extends with send(message)
+    ├── StreamingGateway<I, O>  — connect(input): StreamingConnection<O>
+    ├── NoParamsStreamingGateway<O>  — connect(): StreamingConnection<O>
+    └── BidirectionalStreamingGateway<I, S, O>  — connect(input): BidirectionalStreamingConnection<S, O>
+```
+
+#### Step-by-step flow
+
+```
+1. ViewModel calls: priceStreamGateway.connect("BTC-USD")
+   │  Receives: StreamingConnection<PriceTick>
+        │
+        ▼
+2. PriceStreamGatewayImpl.connect("BTC-USD")
+   │  Creates: WebSocketRequest(path = "/ws/prices/BTC-USD")
+   │  Calls: dataSource.connect("BTC-USD") → WebSocketConnection
+   │  Wraps in: DomainStreamingConnectionAdapter
+        │
+        ▼
+3. Data SDK opens WebSocket connection
+   │  wss://api.example.com/ws/prices/BTC-USD
+   │  WebSocketState → Connecting(0) → Connected
+        │
+        ▼
+4. ConnectionState is mapped automatically:
+   │  WebSocketState.Connecting(0) → ConnectionState.Connecting(0)
+   │  WebSocketState.Connected     → ConnectionState.Connected
+        │
+        ▼
+5. Frames arrive from the server:
+   │  WebSocketFrame.Text('{"price":42000.50}')
+   │    → deserialize → PriceTickDto
+   │    → mapper.map(dto) → PriceTick(price=42000.50)
+   │    → emit: DomainResult.Success(PriceTick(42000.50))
+        │
+        ▼
+6. ViewModel observes:
+   │  connection.state.collect { ... }      ← for connection state UI
+   │  connection.incoming.collect { ... }   ← for real-time data
+```
+
+#### Adapter implementation (bridge)
+
+```kotlin
+class DomainStreamingConnectionAdapter<Dto, T>(
+    private val wsConnection: WebSocketConnection,
+    private val deserialize: (WebSocketFrame) -> Dto?,
+    private val mapper: Mapper<Dto, T>,
+    private val errorMapper: (WebSocketError) -> DomainError = { it.toDomainError() },
+) : StreamingConnection<T> {
+
+    // Maps WebSocketState → ConnectionState
+    override val state: StateFlow<ConnectionState> =
+        wsConnection.state.map { wsState ->
+            when (wsState) {
+                is WebSocketState.Connecting -> ConnectionState.Connecting(wsState.attempt)
+                is WebSocketState.Connected -> ConnectionState.Connected
+                is WebSocketState.Disconnected -> ConnectionState.Disconnected(
+                    error = wsState.error?.let(errorMapper),
+                )
+            }
+        }.stateIn(/* scope */)
+
+    // Maps WebSocketFrame → DomainResult<T>
+    override val incoming: Flow<DomainResult<T>> =
+        wsConnection.incoming.mapNotNull { frame ->
+            try {
+                val dto = deserialize(frame) ?: return@mapNotNull null
+                mapper.map(dto).asSuccess()
+            } catch (e: Exception) {
+                domainFailure(DomainError.Infrastructure("Error deserializing frame", e))
+            }
+        }
+
+    override suspend fun close() {
+        wsConnection.close()
+    }
+}
+```
+
+#### Gateway implementation
+
+```kotlin
+// ── Domain contract ──
+interface PriceStreamGateway : StreamingGateway<String, PriceTick>
+
+// ── Data layer implementation ──
+class PriceStreamGatewayImpl(
+    private val dataSource: PriceStreamDataSource,
+    private val mapper: Mapper<PriceTickDto, PriceTick>,
+) : PriceStreamGateway {
+
+    override fun connect(input: String): StreamingConnection<PriceTick> =
+        DomainStreamingConnectionAdapter(
+            wsConnection = dataSource.connect(input),
+            deserialize = { frame ->
+                when (frame) {
+                    is WebSocketFrame.Text -> Json.decodeFromString(frame.text)
+                    else -> null
+                }
+            },
+            mapper = mapper,
+        )
+}
+```
+
+#### ViewModel usage
+
+```kotlin
+class PriceViewModel(
+    private val priceStream: PriceStreamGateway,
+) : ViewModel() {
+
+    private var connection: StreamingConnection<PriceTick>? = null
+
+    fun startObserving(symbol: String) {
+        connection = priceStream.connect(symbol)
+
+        // Observe connection state
+        viewModelScope.launch {
+            connection!!.state.collect { state ->
+                when (state) {
+                    is ConnectionState.Connecting -> _uiState.value = UiState.Reconnecting(state.attempt)
+                    is ConnectionState.Connected -> _uiState.value = UiState.Connected
+                    is ConnectionState.Disconnected -> _uiState.value = UiState.Disconnected(state.error?.message)
+                }
+            }
+        }
+
+        // Observe prices
+        viewModelScope.launch {
+            connection!!.incoming.collect { result ->
+                result.fold(
+                    onSuccess = { tick -> _price.value = tick },
+                    onFailure = { error -> _lastError.value = error.message },
+                )
+            }
+        }
+    }
+
+    override fun onCleared() {
+        viewModelScope.launch { connection?.close() }
+    }
+}
+```
+
+#### Bidirectional chat
+
+```kotlin
+// ── Domain contract ──
+interface ChatGateway : BidirectionalStreamingGateway<String, ChatMessage, ChatMessage>
+
+// ── ViewModel usage ──
+val chatConnection = chatGateway.connect("room-42")
+
+// Receive messages
+chatConnection.incoming.collect { result ->
+    result.onSuccess { msg -> addToChat(msg) }
+}
+
+// Send messages
+chatConnection.send(ChatMessage(text = "Hello!")).onFailure { error ->
+    showError("Could not send: ${error.message}")
+}
+```
+
 ### Full correspondence table
 
 | Data SDK | Domain SDK | Where they connect |
@@ -4002,6 +4656,14 @@ You can combine any number of observers — they don't interfere with each other
 | `TrustPolicy` / `CertificatePin` | N/A (pure infra) | `KtorHttpEngine.create(config, trustPolicy)` |
 | `NetworkEventObserver` | N/A (pure infra) | `DefaultSafeRequestExecutor(observers = ...)` |
 | `LoggingObserver` | N/A (pure infra) | Configured in wiring |
+| `WebSocketConnection` | `StreamingConnection<T>` | `DomainStreamingConnectionAdapter` |
+| `WebSocketState` | `ConnectionState` | Mapped in adapter: Connecting/Connected/Disconnected |
+| `WebSocketError.*` (8 subtypes) | `DomainError.*` (7 subtypes) | `WebSocketError.toDomainError()` |
+| `SafeWebSocketExecutor` | `StreamingGateway<I, O>` | Gateway impl with adapter |
+| `WebSocketFrame` | Deserialized type `T` | `Mapper<Dto, T>` in the adapter |
+| `ReconnectPolicy` | N/A (pure infra) | Configured in `WebSocketConfig` |
+| `WebSocketEventObserver` | N/A (pure infra) | `DefaultSafeWebSocketExecutor(observers = ...)` |
+| `SecurityError.*` (6 subtypes) | `DomainError.*` (7 subtypes) | `SecurityError.toDomainError()` |
 | DTOs (`@Serializable`) | Domain models (pure) | `Mapper<Dto, Model>` |
 | Batch HTTP requests | `WriteRepository.saveAll()` | Repository impl override |
 
