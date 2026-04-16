@@ -232,144 +232,290 @@ implementarlos como lambdas o como clases:
 Para cálculos, transformaciones, reglas de negocio que **no tocan red ni disco**.
 Seguro desde cualquier hilo, incluyendo el main thread.
 
+**Escenario real:** Un banco necesita evaluar si un cliente califica para un préstamo
+personal. Las reglas dependen del ingreso mensual, el porcentaje de endeudamiento
+y el score crediticio. No hay I/O — son reglas de negocio puras.
+
 ```kotlin
-data class PriceParams(val basePrice: Double, val discountPercent: Double)
-data class PriceResult(val original: Double, val discounted: Double, val savings: Double)
+data class LoanEligibilityParams(
+    val monthlyIncome: Double,
+    val currentDebtPercent: Double,
+    val creditScore: Int,
+    val requestedAmount: Double,
+)
 
-class CalculateDiscountedPrice : PureUseCase<PriceParams, PriceResult> {
+data class LoanEligibilityResult(
+    val approved: Boolean,
+    val maxApprovedAmount: Double,
+    val interestRate: Double,
+    val reason: String,
+)
 
-    override fun invoke(params: PriceParams): DomainResult<PriceResult> {
-        if (params.basePrice < 0)
-            return domainFailure(DomainError.Validation("basePrice", "no puede ser negativo"))
-        if (params.discountPercent !in 0.0..100.0)
-            return domainFailure(DomainError.Validation("discountPercent", "debe estar entre 0 y 100"))
+class EvaluateLoanEligibility : PureUseCase<LoanEligibilityParams, LoanEligibilityResult> {
 
-        val savings = params.basePrice * (params.discountPercent / 100.0)
-        return PriceResult(
-            original = params.basePrice,
-            discounted = params.basePrice - savings,
-            savings = savings,
+    override fun invoke(params: LoanEligibilityParams): DomainResult<LoanEligibilityResult> {
+        // Validar input
+        if (params.monthlyIncome <= 0)
+            return domainFailure(DomainError.Validation("monthlyIncome", "debe ser positivo"))
+        if (params.creditScore !in 300..850)
+            return domainFailure(DomainError.Validation("creditScore", "debe estar entre 300 y 850"))
+
+        // Regla 1: No prestar si el endeudamiento supera el 40%
+        if (params.currentDebtPercent > 40.0) {
+            return LoanEligibilityResult(
+                approved = false,
+                maxApprovedAmount = 0.0,
+                interestRate = 0.0,
+                reason = "Endeudamiento actual supera el 40%",
+            ).asSuccess()
+        }
+
+        // Regla 2: Determinar tasa de interés según score crediticio
+        val interestRate = when {
+            params.creditScore >= 750 -> 8.5
+            params.creditScore >= 650 -> 12.0
+            params.creditScore >= 550 -> 18.5
+            else -> return LoanEligibilityResult(
+                approved = false,
+                maxApprovedAmount = 0.0,
+                interestRate = 0.0,
+                reason = "Score crediticio insuficiente (mínimo 550)",
+            ).asSuccess()
+        }
+
+        // Regla 3: Monto máximo = 5x ingreso mensual
+        val maxAmount = params.monthlyIncome * 5
+        val approved = params.requestedAmount <= maxAmount
+
+        return LoanEligibilityResult(
+            approved = approved,
+            maxApprovedAmount = maxAmount,
+            interestRate = interestRate,
+            reason = if (approved) "Aprobado" else "Monto solicitado excede el máximo permitido",
         ).asSuccess()
     }
 }
 
-// Uso — síncrono, se puede llamar desde cualquier hilo:
-val result = calculateDiscountedPrice(PriceParams(basePrice = 100.0, discountPercent = 15.0))
-// → Success(PriceResult(original=100.0, discounted=85.0, savings=15.0))
+// Uso — síncrono, se puede llamar desde el main thread sin problema:
+val result = evaluateLoanEligibility(
+    LoanEligibilityParams(
+        monthlyIncome = 45_000.0,
+        currentDebtPercent = 25.0,
+        creditScore = 720,
+        requestedAmount = 150_000.0,
+    )
+)
+// → Success(LoanEligibilityResult(approved=true, maxApprovedAmount=225000.0, interestRate=12.0, ...))
 ```
 
 ### 2. SuspendUseCase — Operación async de resultado único
 
 Para operaciones que requieren I/O (persistir, consultar, llamar API) y producen **un solo valor**.
 
+**Escenario real:** Un e-commerce necesita procesar una orden de compra. El caso de uso
+valida el carrito, verifica el inventario, calcula el total con impuestos, reserva el stock
+y persiste la orden. Todo en una sola transacción lógica.
+
 ```kotlin
-data class CreateTaskParams(val title: String)
+data class PlaceOrderParams(
+    val cartId: CartId,
+    val shippingAddressId: AddressId,
+    val paymentMethodId: PaymentMethodId,
+)
 
-class CreateTaskUseCase(
+class PlaceOrderUseCase(
     private val deps: DomainDependencies,
-    private val repository: TaskRepository,
-    private val titleValidator: Validator<String>,
-) : SuspendUseCase<CreateTaskParams, Task> {
+    private val cartRepository: CartRepository,
+    private val inventoryGateway: SuspendGateway<List<CartItem>, InventoryCheckResult>,
+    private val orderRepository: OrderRepository,
+    private val taxCalculator: PureUseCase<TaxParams, TaxResult>,
+) : SuspendUseCase<PlaceOrderParams, Order> {
 
-    override suspend fun invoke(params: CreateTaskParams): DomainResult<Task> {
-        // 1. Validar
-        titleValidator.validate(params.title).let {
-            if (it.isFailure) return it as DomainResult.Failure
-        }
+    override suspend fun invoke(params: PlaceOrderParams): DomainResult<Order> {
+        // 1. Obtener el carrito
+        val cart = cartRepository.findById(params.cartId).getOrElse { return domainFailure(it) }
+            ?: return domainFailure(DomainError.NotFound("Cart", params.cartId.value))
 
-        // 2. Construir agregado
-        val task = Task(
-            id = TaskId(deps.idProvider.next()),
-            title = params.title.trim(),
-            completed = false,
+        if (cart.items.isEmpty())
+            return domainFailure(DomainError.Validation("cart", "El carrito está vacío"))
+
+        // 2. Verificar inventario disponible
+        val inventoryCheck = inventoryGateway.execute(cart.items).getOrElse { return domainFailure(it) }
+        if (!inventoryCheck.allAvailable)
+            return domainFailure(DomainError.Conflict(
+                detail = "Sin stock: ${inventoryCheck.unavailableItems.joinToString { it.name }}"
+            ))
+
+        // 3. Calcular impuestos (lógica pura — PureUseCase)
+        val tax = taxCalculator(TaxParams(cart.subtotal, cart.shippingState))
+            .getOrElse { return domainFailure(it) }
+
+        // 4. Crear la orden
+        val order = Order(
+            id = OrderId(deps.idProvider.next()),
+            items = cart.items,
+            subtotal = cart.subtotal,
+            tax = tax.amount,
+            total = cart.subtotal + tax.amount,
+            status = OrderStatus.CONFIRMED,
             createdAt = deps.clock.nowMillis(),
         )
 
-        // 3. Persistir
-        return repository.save(task).map { task }
+        // 5. Persistir
+        return orderRepository.save(order).map { order }
     }
 }
 
-// Uso — dentro de una coroutine:
+// Uso:
 viewModelScope.launch {
-    createTask(CreateTaskParams("Comprar leche"))
-        .onSuccess { task -> /* actualizar UI */ }
-        .onFailure { error -> /* mostrar error */ }
+    placeOrder(PlaceOrderParams(cartId, addressId, paymentId))
+        .onSuccess { order -> navigateToConfirmation(order.id) }
+        .onFailure { error ->
+            when (error) {
+                is DomainError.Conflict -> showOutOfStockDialog(error.detail)
+                is DomainError.Validation -> showCartError(error.detail)
+                else -> showGenericError(error.message)
+            }
+        }
 }
 ```
 
 ### 3. FlowUseCase — Observar datos que cambian en el tiempo
 
-Para streams reactivos: lista que se actualiza, notificaciones en tiempo real, cambios de estado.
+Para streams reactivos: datos que se actualizan, notificaciones en tiempo real, cambios de estado.
 Cada emisión puede ser éxito o fallo individualmente sin cancelar el stream.
 
+**Escenario real:** Un dashboard de logística donde un operador observa los envíos
+filtrados por estado (pendiente, en tránsito, entregado). Cada vez que un envío
+cambia de estado, la lista se actualiza automáticamente.
+
 ```kotlin
-data class TaskFilterParams(val completed: Boolean)
+data class ShipmentFilterParams(
+    val status: ShipmentStatus,
+    val warehouseId: WarehouseId,
+)
 
-class ObserveTasksByStatus(
-    private val repository: TaskRepository,
-) : FlowUseCase<TaskFilterParams, List<Task>> {
+class ObserveShipmentsByStatus(
+    private val shipmentRepository: ShipmentRepository,
+) : FlowUseCase<ShipmentFilterParams, List<Shipment>> {
 
-    override fun invoke(params: TaskFilterParams): Flow<DomainResult<List<Task>>> {
-        return repository.observeByStatus(params.completed)
+    override fun invoke(params: ShipmentFilterParams): Flow<DomainResult<List<Shipment>>> {
+        return shipmentRepository
+            .observeByWarehouseAndStatus(params.warehouseId, params.status)
     }
 }
 
-// Uso — colectar el Flow:
-observeTasksByStatus(TaskFilterParams(completed = false))
-    .collect { result ->
-        result
-            .onSuccess { tasks -> _uiState.value = UiState.Loaded(tasks) }
-            .onFailure { error -> _uiState.value = UiState.Error(error.message) }
+// Uso — en el ViewModel:
+init {
+    viewModelScope.launch {
+        observeShipmentsByStatus(
+            ShipmentFilterParams(
+                status = ShipmentStatus.IN_TRANSIT,
+                warehouseId = currentWarehouseId,
+            )
+        ).collect { result ->
+            result
+                .onSuccess { shipments ->
+                    _uiState.value = DashboardState.Loaded(
+                        shipments = shipments,
+                        count = shipments.size,
+                    )
+                }
+                .onFailure { error ->
+                    _uiState.value = DashboardState.Error(error.message)
+                }
+        }
     }
+}
 ```
 
 ### 4. NoParamsUseCase — Async sin parámetros
 
 Igual que `SuspendUseCase` pero cuando **no necesitas parámetros**. Evita pasar `Unit`.
 
+**Escenario real:** Una app de salud necesita cerrar la sesión del usuario. Esto implica
+invalidar el token en el servidor, limpiar la caché local y registrar el evento de logout.
+No necesita parámetros — la sesión activa determina todo.
+
 ```kotlin
-class GetCurrentUser(
-    private val userRepository: UserRepository,
-    private val sessionGateway: SuspendGateway<Unit, UserId>,
-) : NoParamsUseCase<User> {
+class LogoutUseCase(
+    private val sessionGateway: CommandGateway<LogoutCommand>,
+    private val localCacheGateway: CommandGateway<ClearCacheCommand>,
+    private val auditRepository: WriteRepository<AuditEvent>,
+    private val deps: DomainDependencies,
+) : NoParamsUseCase<Unit> {
 
-    override suspend fun invoke(): DomainResult<User> {
-        val userIdResult = sessionGateway.execute(Unit)
-        if (userIdResult.isFailure) return userIdResult as DomainResult.Failure
+    override suspend fun invoke(): DomainResult<Unit> {
+        // 1. Invalidar token en el servidor
+        sessionGateway.dispatch(LogoutCommand).getOrElse { return domainFailure(it) }
 
-        val userId = userIdResult.getOrNull()!!
+        // 2. Limpiar datos locales sensibles
+        localCacheGateway.dispatch(ClearCacheCommand).getOrElse { return domainFailure(it) }
 
-        return userRepository.findById(userId).flatMap { user ->
-            if (user != null) user.asSuccess()
-            else domainFailure(DomainError.NotFound("User", userId.value))
-        }
+        // 3. Registrar evento de auditoría
+        val event = AuditEvent(
+            id = AuditEventId(deps.idProvider.next()),
+            type = "LOGOUT",
+            timestamp = deps.clock.nowMillis(),
+        )
+        return auditRepository.save(event)
     }
 }
 
-// Uso — sin pasar parámetros:
-val result = getCurrentUser()
+// Uso — sin parámetros:
+viewModelScope.launch {
+    logout()
+        .onSuccess { navigateToLogin() }
+        .onFailure { error -> showError("No se pudo cerrar sesión: ${error.message}") }
+}
 ```
 
 ### 5. NoParamsFlowUseCase — Stream reactivo sin parámetros
 
 Ideal para observar datos globales que no requieren filtro.
 
-```kotlin
-class ObserveNotifications(
-    private val notificationRepository: NotificationRepository,
-) : NoParamsFlowUseCase<List<Notification>> {
+**Escenario real:** Una app de fintech necesita mostrar el valor total del portafolio
+de inversiones del usuario actualizado en tiempo real. El valor cambia conforme
+fluctúan los precios de los activos. No necesita parámetros — el usuario autenticado
+determina qué portafolio observar.
 
-    override fun invoke(): Flow<DomainResult<List<Notification>>> {
-        return notificationRepository.observeAll()
+```kotlin
+class ObservePortfolioValue(
+    private val portfolioRepository: PortfolioRepository,
+) : NoParamsFlowUseCase<PortfolioSummary> {
+
+    override fun invoke(): Flow<DomainResult<PortfolioSummary>> {
+        return portfolioRepository.observeCurrentUserPortfolio()
+        // Emite cada vez que cambia un precio o se ejecuta una transacción
     }
 }
 
-// Uso:
-observeNotifications()
-    .collect { result ->
-        result.onSuccess { notifications -> updateBadge(notifications.size) }
+data class PortfolioSummary(
+    val totalValue: Double,
+    val dailyChange: Double,
+    val dailyChangePercent: Double,
+    val holdings: List<Holding>,
+)
+
+// Uso — en el ViewModel de la pantalla principal:
+init {
+    viewModelScope.launch {
+        observePortfolioValue()
+            .collect { result ->
+                result
+                    .onSuccess { summary ->
+                        _uiState.value = HomeState.Loaded(
+                            totalValue = summary.totalValue,
+                            changePercent = summary.dailyChangePercent,
+                            isPositive = summary.dailyChange >= 0,
+                        )
+                    }
+                    .onFailure { error ->
+                        _uiState.value = HomeState.Error(error.message)
+                    }
+            }
     }
+}
 ```
 
 ### Diagrama de decisión
@@ -965,140 +1111,270 @@ implementation as lambdas or classes:
 
 ### 1. PureUseCase — Synchronous, pure logic
 
-For calculations, transformations, business rules that **don’t touch network or disk**.
+For calculations, transformations, business rules that **don't touch network or disk**.
 Safe from any thread, including the main thread.
 
+**Real-world scenario:** A bank needs to evaluate whether a client qualifies for a
+personal loan. Rules depend on monthly income, debt-to-income ratio, and credit score.
+No I/O — pure business rules.
+
 ```kotlin
-data class PriceParams(val basePrice: Double, val discountPercent: Double)
-data class PriceResult(val original: Double, val discounted: Double, val savings: Double)
+data class LoanEligibilityParams(
+    val monthlyIncome: Double,
+    val currentDebtPercent: Double,
+    val creditScore: Int,
+    val requestedAmount: Double,
+)
 
-class CalculateDiscountedPrice : PureUseCase<PriceParams, PriceResult> {
+data class LoanEligibilityResult(
+    val approved: Boolean,
+    val maxApprovedAmount: Double,
+    val interestRate: Double,
+    val reason: String,
+)
 
-    override fun invoke(params: PriceParams): DomainResult<PriceResult> {
-        if (params.basePrice < 0)
-            return domainFailure(DomainError.Validation("basePrice", "must not be negative"))
-        if (params.discountPercent !in 0.0..100.0)
-            return domainFailure(DomainError.Validation("discountPercent", "must be between 0 and 100"))
+class EvaluateLoanEligibility : PureUseCase<LoanEligibilityParams, LoanEligibilityResult> {
 
-        val savings = params.basePrice * (params.discountPercent / 100.0)
-        return PriceResult(
-            original = params.basePrice,
-            discounted = params.basePrice - savings,
-            savings = savings,
+    override fun invoke(params: LoanEligibilityParams): DomainResult<LoanEligibilityResult> {
+        if (params.monthlyIncome <= 0)
+            return domainFailure(DomainError.Validation("monthlyIncome", "must be positive"))
+        if (params.creditScore !in 300..850)
+            return domainFailure(DomainError.Validation("creditScore", "must be between 300 and 850"))
+
+        // Rule 1: Deny if debt exceeds 40%
+        if (params.currentDebtPercent > 40.0) {
+            return LoanEligibilityResult(
+                approved = false, maxApprovedAmount = 0.0, interestRate = 0.0,
+                reason = "Current debt exceeds 40%",
+            ).asSuccess()
+        }
+
+        // Rule 2: Interest rate based on credit score
+        val interestRate = when {
+            params.creditScore >= 750 -> 8.5
+            params.creditScore >= 650 -> 12.0
+            params.creditScore >= 550 -> 18.5
+            else -> return LoanEligibilityResult(
+                approved = false, maxApprovedAmount = 0.0, interestRate = 0.0,
+                reason = "Insufficient credit score (minimum 550)",
+            ).asSuccess()
+        }
+
+        // Rule 3: Max amount = 5x monthly income
+        val maxAmount = params.monthlyIncome * 5
+        val approved = params.requestedAmount <= maxAmount
+
+        return LoanEligibilityResult(
+            approved = approved, maxApprovedAmount = maxAmount, interestRate = interestRate,
+            reason = if (approved) "Approved" else "Requested amount exceeds maximum allowed",
         ).asSuccess()
     }
 }
 
-// Usage — synchronous, callable from any thread:
-val result = calculateDiscountedPrice(PriceParams(basePrice = 100.0, discountPercent = 15.0))
-// → Success(PriceResult(original=100.0, discounted=85.0, savings=15.0))
+// Usage — synchronous, safe from main thread:
+val result = evaluateLoanEligibility(
+    LoanEligibilityParams(monthlyIncome = 45_000.0, currentDebtPercent = 25.0, creditScore = 720, requestedAmount = 150_000.0)
+)
+// → Success(LoanEligibilityResult(approved=true, maxApprovedAmount=225000.0, interestRate=12.0, ...))
 ```
 
 ### 2. SuspendUseCase — Async single-result
 
 For operations requiring I/O (persist, query, call API) that produce **one value**.
 
+**Real-world scenario:** An e-commerce app needs to place an order. The use case validates
+the cart, checks inventory, calculates taxes, and persists the order — all in one logical
+transaction.
+
 ```kotlin
-data class CreateTaskParams(val title: String)
+data class PlaceOrderParams(
+    val cartId: CartId,
+    val shippingAddressId: AddressId,
+    val paymentMethodId: PaymentMethodId,
+)
 
-class CreateTaskUseCase(
+class PlaceOrderUseCase(
     private val deps: DomainDependencies,
-    private val repository: TaskRepository,
-    private val titleValidator: Validator<String>,
-) : SuspendUseCase<CreateTaskParams, Task> {
+    private val cartRepository: CartRepository,
+    private val inventoryGateway: SuspendGateway<List<CartItem>, InventoryCheckResult>,
+    private val orderRepository: OrderRepository,
+    private val taxCalculator: PureUseCase<TaxParams, TaxResult>,
+) : SuspendUseCase<PlaceOrderParams, Order> {
 
-    override suspend fun invoke(params: CreateTaskParams): DomainResult<Task> {
-        titleValidator.validate(params.title).let {
-            if (it.isFailure) return it as DomainResult.Failure
-        }
-        val task = Task(
-            id = TaskId(deps.idProvider.next()),
-            title = params.title.trim(),
-            completed = false,
+    override suspend fun invoke(params: PlaceOrderParams): DomainResult<Order> {
+        // 1. Fetch cart
+        val cart = cartRepository.findById(params.cartId).getOrElse { return domainFailure(it) }
+            ?: return domainFailure(DomainError.NotFound("Cart", params.cartId.value))
+
+        if (cart.items.isEmpty())
+            return domainFailure(DomainError.Validation("cart", "Cart is empty"))
+
+        // 2. Check inventory
+        val inventoryCheck = inventoryGateway.execute(cart.items).getOrElse { return domainFailure(it) }
+        if (!inventoryCheck.allAvailable)
+            return domainFailure(DomainError.Conflict(
+                detail = "Out of stock: ${inventoryCheck.unavailableItems.joinToString { it.name }}"
+            ))
+
+        // 3. Calculate tax (pure logic — PureUseCase)
+        val tax = taxCalculator(TaxParams(cart.subtotal, cart.shippingState))
+            .getOrElse { return domainFailure(it) }
+
+        // 4. Build order
+        val order = Order(
+            id = OrderId(deps.idProvider.next()),
+            items = cart.items,
+            subtotal = cart.subtotal,
+            tax = tax.amount,
+            total = cart.subtotal + tax.amount,
+            status = OrderStatus.CONFIRMED,
             createdAt = deps.clock.nowMillis(),
         )
-        return repository.save(task).map { task }
+
+        // 5. Persist
+        return orderRepository.save(order).map { order }
     }
 }
 
-// Usage — inside a coroutine:
+// Usage:
 viewModelScope.launch {
-    createTask(CreateTaskParams("Buy milk"))
-        .onSuccess { task -> /* update UI */ }
-        .onFailure { error -> /* show error */ }
+    placeOrder(PlaceOrderParams(cartId, addressId, paymentId))
+        .onSuccess { order -> navigateToConfirmation(order.id) }
+        .onFailure { error ->
+            when (error) {
+                is DomainError.Conflict -> showOutOfStockDialog(error.detail)
+                is DomainError.Validation -> showCartError(error.detail)
+                else -> showGenericError(error.message)
+            }
+        }
 }
 ```
 
 ### 3. FlowUseCase — Observe data over time
 
-For reactive streams: self-updating lists, real-time notifications, state changes.
+For reactive streams: self-updating data, real-time notifications, state changes.
 Each emission can be success or failure individually without cancelling the stream.
 
+**Real-world scenario:** A logistics dashboard where an operator observes shipments
+filtered by status (pending, in transit, delivered). Whenever a shipment changes
+status, the list updates automatically.
+
 ```kotlin
-data class TaskFilterParams(val completed: Boolean)
+data class ShipmentFilterParams(
+    val status: ShipmentStatus,
+    val warehouseId: WarehouseId,
+)
 
-class ObserveTasksByStatus(
-    private val repository: TaskRepository,
-) : FlowUseCase<TaskFilterParams, List<Task>> {
+class ObserveShipmentsByStatus(
+    private val shipmentRepository: ShipmentRepository,
+) : FlowUseCase<ShipmentFilterParams, List<Shipment>> {
 
-    override fun invoke(params: TaskFilterParams): Flow<DomainResult<List<Task>>> {
-        return repository.observeByStatus(params.completed)
+    override fun invoke(params: ShipmentFilterParams): Flow<DomainResult<List<Shipment>>> {
+        return shipmentRepository
+            .observeByWarehouseAndStatus(params.warehouseId, params.status)
     }
 }
 
-// Usage — collect the Flow:
-observeTasksByStatus(TaskFilterParams(completed = false))
-    .collect { result ->
-        result
-            .onSuccess { tasks -> _uiState.value = UiState.Loaded(tasks) }
-            .onFailure { error -> _uiState.value = UiState.Error(error.message) }
+// Usage — in the ViewModel:
+init {
+    viewModelScope.launch {
+        observeShipmentsByStatus(
+            ShipmentFilterParams(status = ShipmentStatus.IN_TRANSIT, warehouseId = currentWarehouseId)
+        ).collect { result ->
+            result
+                .onSuccess { shipments ->
+                    _uiState.value = DashboardState.Loaded(shipments = shipments, count = shipments.size)
+                }
+                .onFailure { error -> _uiState.value = DashboardState.Error(error.message) }
+        }
     }
+}
 ```
 
 ### 4. NoParamsUseCase — Async without parameters
 
 Same as `SuspendUseCase` but when **no parameters are needed**. Avoids passing `Unit`.
 
-```kotlin
-class GetCurrentUser(
-    private val userRepository: UserRepository,
-    private val sessionGateway: SuspendGateway<Unit, UserId>,
-) : NoParamsUseCase<User> {
+**Real-world scenario:** A healthcare app needs to log the user out. This involves
+invalidating the token on the server, clearing the local cache, and recording an
+audit event. No parameters needed — the active session determines everything.
 
-    override suspend fun invoke(): DomainResult<User> {
-        val userIdResult = sessionGateway.execute(Unit)
-        if (userIdResult.isFailure) return userIdResult as DomainResult.Failure
-        val userId = userIdResult.getOrNull()!!
-        return userRepository.findById(userId).flatMap { user ->
-            if (user != null) user.asSuccess()
-            else domainFailure(DomainError.NotFound("User", userId.value))
-        }
+```kotlin
+class LogoutUseCase(
+    private val sessionGateway: CommandGateway<LogoutCommand>,
+    private val localCacheGateway: CommandGateway<ClearCacheCommand>,
+    private val auditRepository: WriteRepository<AuditEvent>,
+    private val deps: DomainDependencies,
+) : NoParamsUseCase<Unit> {
+
+    override suspend fun invoke(): DomainResult<Unit> {
+        // 1. Invalidate token on the server
+        sessionGateway.dispatch(LogoutCommand).getOrElse { return domainFailure(it) }
+
+        // 2. Clear sensitive local data
+        localCacheGateway.dispatch(ClearCacheCommand).getOrElse { return domainFailure(it) }
+
+        // 3. Record audit event
+        val event = AuditEvent(
+            id = AuditEventId(deps.idProvider.next()),
+            type = "LOGOUT",
+            timestamp = deps.clock.nowMillis(),
+        )
+        return auditRepository.save(event)
     }
 }
 
 // Usage — no parameters:
-val result = getCurrentUser()
+viewModelScope.launch {
+    logout()
+        .onSuccess { navigateToLogin() }
+        .onFailure { error -> showError("Could not log out: ${error.message}") }
+}
 ```
 
 ### 5. NoParamsFlowUseCase — Reactive stream without parameters
 
 Ideal for observing global data that requires no filter.
 
-```kotlin
-class ObserveNotifications(
-    private val notificationRepository: NotificationRepository,
-) : NoParamsFlowUseCase<List<Notification>> {
+**Real-world scenario:** A fintech app needs to display the user's investment portfolio
+total value updated in real time. The value changes as asset prices fluctuate. No
+parameters needed — the authenticated user determines which portfolio to observe.
 
-    override fun invoke(): Flow<DomainResult<List<Notification>>> {
-        return notificationRepository.observeAll()
+```kotlin
+class ObservePortfolioValue(
+    private val portfolioRepository: PortfolioRepository,
+) : NoParamsFlowUseCase<PortfolioSummary> {
+
+    override fun invoke(): Flow<DomainResult<PortfolioSummary>> {
+        return portfolioRepository.observeCurrentUserPortfolio()
+        // Emits every time a price changes or a transaction is executed
     }
 }
 
-// Usage:
-observeNotifications()
-    .collect { result ->
-        result.onSuccess { notifications -> updateBadge(notifications.size) }
+data class PortfolioSummary(
+    val totalValue: Double,
+    val dailyChange: Double,
+    val dailyChangePercent: Double,
+    val holdings: List<Holding>,
+)
+
+// Usage — in the home screen ViewModel:
+init {
+    viewModelScope.launch {
+        observePortfolioValue()
+            .collect { result ->
+                result
+                    .onSuccess { summary ->
+                        _uiState.value = HomeState.Loaded(
+                            totalValue = summary.totalValue,
+                            changePercent = summary.dailyChangePercent,
+                            isPositive = summary.dailyChange >= 0,
+                        )
+                    }
+                    .onFailure { error -> _uiState.value = HomeState.Error(error.message) }
+            }
     }
+}
 ```
 
 ### Decision diagram
