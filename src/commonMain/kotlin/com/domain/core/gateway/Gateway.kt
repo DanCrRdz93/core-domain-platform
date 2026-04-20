@@ -31,6 +31,20 @@ public interface Gateway
  * - [DomainResult] ensures that infrastructure failures are mapped to
  *   [com.domain.core.error.DomainError] before crossing into the domain.
  *   The domain must never receive raw exceptions from infrastructure.
+ *
+ * Example — domain contract:
+ * ```kotlin
+ * interface AuthGateway : SuspendGateway<Credentials, AuthToken>
+ * ```
+ *
+ * Example — data-layer implementation:
+ * ```kotlin
+ * class AuthGatewayImpl(private val api: AuthApi) : AuthGateway {
+ *     override suspend fun execute(input: Credentials): DomainResult<AuthToken> =
+ *         runDomainCatching { api.login(input.email, input.password) }
+ *             .map { AuthToken(it.accessToken, it.expiresIn) }
+ * }
+ * ```
  */
 public interface SuspendGateway<in I, out O> : Gateway {
     public suspend fun execute(input: I): DomainResult<O>
@@ -42,6 +56,14 @@ public interface SuspendGateway<in I, out O> : Gateway {
  *
  * Returns [DomainResult<Unit>] so that dispatch failures are still
  * observable at the call site when the caller cares.
+ *
+ * Example:
+ * ```kotlin
+ * interface AnalyticsGateway : CommandGateway<AnalyticsEvent>
+ *
+ * // Call site (fire-and-forget):
+ * analyticsGateway.dispatch(AnalyticsEvent.ScreenViewed("home"))
+ * ```
  */
 public interface CommandGateway<in I> : Gateway {
     public suspend fun dispatch(input: I): DomainResult<Unit>
@@ -60,6 +82,16 @@ public interface CommandGateway<in I> : Gateway {
  *   from the data SDK, real-time price tickers, connectivity monitors.
  * - Each emission is wrapped in [DomainResult] so that transient errors
  *   can be reported without cancelling the stream.
+ *
+ * Example:
+ * ```kotlin
+ * interface PriceTickerGateway : FlowGateway<String, PriceTick>
+ *
+ * // Call site:
+ * priceTickerGateway.observe("BTC-USD").collect { result ->
+ *     result.onSuccess { tick -> updatePrice(tick) }
+ * }
+ * ```
  */
 public interface FlowGateway<in I, out O> : Gateway {
     public fun observe(input: I): Flow<DomainResult<O>>
@@ -71,6 +103,16 @@ public interface FlowGateway<in I, out O> : Gateway {
  *
  * Typical consumers: session state changes, connectivity status,
  * unread notification count.
+ *
+ * Example:
+ * ```kotlin
+ * interface ConnectivityGateway : NoParamsFlowGateway<Boolean>
+ *
+ * // Call site:
+ * connectivityGateway.observe().collect { result ->
+ *     result.onSuccess { isOnline -> updateConnectionBanner(isOnline) }
+ * }
+ * ```
  */
 public interface NoParamsFlowGateway<out O> : Gateway {
     public fun observe(): Flow<DomainResult<O>>

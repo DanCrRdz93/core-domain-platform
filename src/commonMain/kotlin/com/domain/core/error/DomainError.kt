@@ -13,12 +13,31 @@ package com.domain.core.error
  *   exceptions. Exposing cause on [Validation], [NotFound], etc. would pollute
  *   pure domain errors with infrastructure semantics.
  * - Subclasses are final (data class) to prevent uncontrolled extension.
+ *
+ * Example — exhaustive `when` in a ViewModel:
+ * ```kotlin
+ * fun handleError(error: DomainError) = when (error) {
+ *     is DomainError.Validation     -> showFieldError(error.field, error.detail)
+ *     is DomainError.NotFound       -> showNotFound(error.resourceType)
+ *     is DomainError.Unauthorized   -> navigateToLogin()
+ *     is DomainError.Conflict       -> showConflict(error.detail)
+ *     is DomainError.Infrastructure -> showRetryDialog(error.detail)
+ *     is DomainError.Cancelled      -> { /* no-op, user navigated away */ }
+ *     is DomainError.Unknown        -> showGenericError()
+ * }
+ * ```
  */
 public sealed class DomainError(public val message: String) {
 
     /**
      * The input provided does not satisfy domain invariants.
      * [field] identifies which field or parameter was invalid.
+     *
+     * Example:
+     * ```kotlin
+     * val error = DomainError.Validation(field = "email", detail = "must contain @")
+     * println(error.message) // "'email' must contain @"
+     * ```
      */
     public data class Validation(
         val field: String,
@@ -27,6 +46,12 @@ public sealed class DomainError(public val message: String) {
 
     /**
      * The requested resource or aggregate does not exist.
+     *
+     * Example:
+     * ```kotlin
+     * val error = DomainError.NotFound(resourceType = "Order", id = "ORD-999")
+     * println(error.message) // "Resource 'Order' with id 'ORD-999' not found."
+     * ```
      */
     public data class NotFound(
         val resourceType: String,
@@ -35,6 +60,16 @@ public sealed class DomainError(public val message: String) {
 
     /**
      * The caller is not authorised to perform the requested operation.
+     *
+     * Example:
+     * ```kotlin
+     * val error = DomainError.Unauthorized("Token expired")
+     * println(error.message) // "Token expired"
+     *
+     * // Default message:
+     * val defaultError = DomainError.Unauthorized()
+     * println(defaultError.message) // "Unauthorized"
+     * ```
      */
     public data class Unauthorized(
         val detail: String = "Unauthorized",
@@ -43,6 +78,11 @@ public sealed class DomainError(public val message: String) {
     /**
      * The operation conflicts with the current state of the domain.
      * E.g., duplicate entity, invalid state transition.
+     *
+     * Example:
+     * ```kotlin
+     * val error = DomainError.Conflict("User with email 'a@b.com' already exists")
+     * ```
      */
     public data class Conflict(
         val detail: String,
@@ -56,6 +96,14 @@ public sealed class DomainError(public val message: String) {
      * [cause] is `Throwable?` by design. When bridging from the data SDK,
      * pass `diagnostic?.cause` (the underlying exception), NOT the
      * `NetworkError` itself — `NetworkError` is not a `Throwable`.
+     *
+     * Example — bridging from data SDK:
+     * ```kotlin
+     * is NetworkError.Http -> DomainError.Infrastructure(
+     *     detail = "HTTP ${statusCode}: ${body}",
+     *     cause = diagnostic?.cause,
+     * )
+     * ```
      */
     public data class Infrastructure(
         val detail: String,
@@ -73,6 +121,11 @@ public sealed class DomainError(public val message: String) {
      * - This maps directly from `NetworkError.Cancelled` in the data SDK.
      * - Consumers should typically treat this as a no-op (suppress the error
      *   in the UI) rather than showing an error dialog.
+     *
+     * Example:
+     * ```kotlin
+     * is NetworkError.Cancelled -> DomainError.Cancelled("User cancelled the request")
+     * ```
      */
     public data class Cancelled(
         val detail: String = "Operation was cancelled.",
@@ -83,6 +136,12 @@ public sealed class DomainError(public val message: String) {
      * Usage should be rare; prefer a specific subclass.
      *
      * [cause] is `Throwable?` — same contract as [Infrastructure].
+     *
+     * Example:
+     * ```kotlin
+     * val result = runDomainCatching { riskyOperation() }
+     * // Unhandled exceptions become: DomainError.Unknown(cause = exception)
+     * ```
      */
     public data class Unknown(
         val detail: String = "An unexpected error occurred.",

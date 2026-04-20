@@ -16,6 +16,16 @@ import kotlinx.coroutines.flow.Flow
  * - Concrete repository interfaces live in the domain packages that own their
  *   aggregate, extending this marker for discoverability and DI scanning.
  * - No generics here: each aggregate defines its own explicit contract.
+ *
+ * Example:
+ * ```kotlin
+ * interface UserRepository : ReadWriteRepository<UserId, User>
+ *
+ * // Or a narrow, custom contract:
+ * interface ProductCatalogRepository : Repository {
+ *     suspend fun search(query: String): DomainResult<List<Product>>
+ * }
+ * ```
  */
 public interface Repository
 
@@ -27,6 +37,22 @@ public interface Repository
  * - [existsById] avoids fetching a full aggregate when only existence matters.
  *   Default implementation delegates to [findById] so implementors only need
  *   to override it when an optimised query is available (e.g., `SELECT 1`).
+ *
+ * Example:
+ * ```kotlin
+ * class UserRepositoryImpl(
+ *     private val api: UserApi,
+ *     private val mapper: Mapper<UserDto, User>,
+ * ) : ReadRepository<UserId, User> {
+ *
+ *     override suspend fun findById(id: UserId): DomainResult<User?> =
+ *         runDomainCatching { api.getUser(id.value) }.map { mapper.map(it) }
+ * }
+ *
+ * // Call site:
+ * val user = userRepo.findById(UserId("42"))
+ * val exists = userRepo.existsById(UserId("42")) // delegates to findById
+ * ```
  */
 public interface ReadRepository<in ID, out T> : Repository {
     public suspend fun findById(id: ID): DomainResult<T?>
@@ -45,6 +71,17 @@ public interface ReadRepository<in ID, out T> : Repository {
  *   "get all active users"), while others need live updates (e.g., a dashboard).
  *
  * [T] — the aggregate root type.
+ *
+ * Example:
+ * ```kotlin
+ * // One-shot fetch:
+ * val users = userRepo.findAll().getOrNull().orEmpty()
+ *
+ * // Live updates in a ViewModel:
+ * userRepo.observeAll().collect { result ->
+ *     result.onSuccess { users -> _state.value = UsersLoaded(users) }
+ * }
+ * ```
  */
 public interface ReadCollectionRepository<out T> : Repository {
     public suspend fun findAll(): DomainResult<List<T>>
@@ -62,6 +99,15 @@ public interface ReadCollectionRepository<out T> : Repository {
  * - Default implementations are fail-fast: they stop at the first failure.
  *
  * [T] — the aggregate root type.
+ *
+ * Example:
+ * ```kotlin
+ * val result = userRepo.save(newUser)
+ * result.onSuccess { println("Saved!") }
+ *
+ * // Batch:
+ * userRepo.saveAll(listOf(user1, user2, user3))
+ * ```
  */
 public interface WriteRepository<in T> : Repository {
     public suspend fun save(entity: T): DomainResult<Unit>
@@ -92,6 +138,14 @@ public interface WriteRepository<in T> : Repository {
  *   avoids `MyRepo : ReadRepository<ID, T>, ReadCollectionRepository<T>, WriteRepository<T>`
  *   boilerplate in every feature module.
  * - If an aggregate only needs a subset, use the granular interfaces directly.
+ *
+ * Example:
+ * ```kotlin
+ * interface OrderRepository : ReadWriteRepository<OrderId, Order>
+ *
+ * // The implementation gets findById, findAll, observeAll, save, delete,
+ * // saveAll, deleteAll — all from a single interface.
+ * ```
  */
 public interface ReadWriteRepository<in ID, T> :
     ReadRepository<ID, T>,

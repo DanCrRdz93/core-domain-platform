@@ -14,5 +14,21 @@ package com.domain.core.model
  * - Value objects should be small and focused. Do not create value objects for
  *   every primitive — only when the type carries business rules or prevents
  *   primitive obsession at meaningful boundaries.
+ *
+ * Example:
+ * ```kotlin
+ * data class Money(
+ *     val amount: Double,
+ *     val currency: String,
+ * ) : ValueObject {
+ *     init {
+ *         require(amount >= 0) { "amount must be >= 0" }
+ *         require(currency.length == 3) { "currency must be ISO 4217" }
+ *     }
+ * }
+ *
+ * // Structural equality:
+ * Money(10.0, "USD") == Money(10.0, "USD") // true
+ * ```
  */
 public interface ValueObject

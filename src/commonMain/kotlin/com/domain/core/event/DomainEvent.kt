@@ -38,6 +38,32 @@ public interface DomainEvent {
  * - Returns nothing (fire-and-forget from the domain's perspective).
  *   If delivery guarantees are needed, the infrastructure implementation
  *   handles persistence/retry internally.
+ *
+ * Example — use case publishing an event:
+ * ```kotlin
+ * class PlaceOrderUseCase(
+ *     private val orderRepo: OrderRepository,
+ *     private val publisher: DomainEventPublisher,
+ *     private val clock: ClockProvider,
+ * ) : SuspendUseCase<PlaceOrderParams, Order> {
+ *
+ *     override suspend fun invoke(params: PlaceOrderParams): DomainResult<Order> {
+ *         val order = Order.create(params)
+ *         return orderRepo.save(order).map {
+ *             publisher.publish(OrderPlaced(order.id, order.total, clock.nowMillis()))
+ *             order
+ *         }
+ *     }
+ * }
+ * ```
+ *
+ * Example — in-memory implementation:
+ * ```kotlin
+ * class InMemoryEventPublisher : DomainEventPublisher {
+ *     val events = mutableListOf<DomainEvent>()
+ *     override suspend fun publish(event: DomainEvent) { events.add(event) }
+ * }
+ * ```
  */
 public fun interface DomainEventPublisher {
     public suspend fun publish(event: DomainEvent)
@@ -50,6 +76,18 @@ public fun interface DomainEventPublisher {
  * - Consumers (projections, notification triggers, analytics) implement
  *   [DomainEventHandler] and are registered with the dispatcher.
  * - [T] narrows the event type so handlers are type-safe.
+ *
+ * Example:
+ * ```kotlin
+ * class SendOrderConfirmationEmail : DomainEventHandler<OrderPlaced> {
+ *     override suspend fun handle(event: OrderPlaced) {
+ *         emailService.send(
+ *             to = event.customerEmail,
+ *             subject = "Order ${event.orderId} confirmed",
+ *         )
+ *     }
+ * }
+ * ```
  */
 public fun interface DomainEventHandler<in T : DomainEvent> {
     public suspend fun handle(event: T)

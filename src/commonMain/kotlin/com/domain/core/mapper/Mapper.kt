@@ -39,6 +39,11 @@ public fun interface Mapper<in I, out O> {
 /**
  * Maps a [List] of inputs using this [Mapper].
  * Avoids writing `.map { mapper.map(it) }` at every call site.
+ *
+ * Example:
+ * ```kotlin
+ * val users: List<User> = userMapper.mapList(userDtos)
+ * ```
  */
 public fun <I, O> Mapper<I, O>.mapList(inputs: List<I>): List<O> =
     inputs.map { map(it) }
@@ -48,6 +53,15 @@ public fun <I, O> Mapper<I, O>.mapList(inputs: List<I>): List<O> =
  *
  * Useful when mapping passes through an intermediate representation:
  * `dtoToIntermediate.andThen(intermediateToModel)`.
+ *
+ * Example:
+ * ```kotlin
+ * val jsonToDto: Mapper<String, UserDto> = Mapper { Json.decodeFromString(it) }
+ * val dtoToUser: Mapper<UserDto, User> = Mapper { User(it.id, it.name) }
+ *
+ * val jsonToUser: Mapper<String, User> = jsonToDto.andThen(dtoToUser)
+ * val user = jsonToUser.map(jsonString)
+ * ```
  */
 public fun <A, B, C> Mapper<A, B>.andThen(other: Mapper<B, C>): Mapper<A, C> =
     Mapper { input -> other.map(map(input)) }
@@ -63,6 +77,20 @@ public fun <A, B, C> Mapper<A, B>.andThen(other: Mapper<B, C>): Mapper<A, C> =
  *
  * [I] — the "external" type (DTO, DB entity).
  * [O] — the "domain" type (aggregate, value object).
+ *
+ * Example:
+ * ```kotlin
+ * class UserMapper : BidirectionalMapper<UserDto, User> {
+ *     override fun map(input: UserDto): User =
+ *         User(id = UserId(input.id), name = input.name)
+ *
+ *     override fun reverseMap(output: User): UserDto =
+ *         UserDto(id = output.id.value, name = output.name)
+ * }
+ *
+ * // Read: val user = userMapper.map(dto)
+ * // Write: val dto = userMapper.reverseMap(user)
+ * ```
  */
 public interface BidirectionalMapper<I, O> : Mapper<I, O> {
     public fun reverseMap(output: O): I

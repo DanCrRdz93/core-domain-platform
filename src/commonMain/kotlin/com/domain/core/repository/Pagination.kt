@@ -15,6 +15,20 @@ import com.domain.core.result.DomainResult
  *   provide them (e.g., cursor-based pagination).
  *
  * [T] — the domain model type.
+ *
+ * Example:
+ * ```kotlin
+ * val page = Page(
+ *     items = listOf(user1, user2),
+ *     page = 0,
+ *     size = 20,
+ *     totalPages = 5,
+ *     totalItems = 100,
+ * )
+ * println(page.hasNext)     // true  (page 0 < 4)
+ * println(page.hasPrevious) // false (page 0)
+ * println(page.isEmpty)     // false
+ * ```
  */
 public data class Page<out T>(
     val items: List<T>,
@@ -35,6 +49,19 @@ public data class Page<out T>(
  * - Kept as a separate data class rather than raw `page: Int, size: Int`
  *   parameters so that it can be extended with sorting or filtering without
  *   breaking existing signatures.
+ *
+ * Example:
+ * ```kotlin
+ * // Default: page 0, size 20
+ * val first = PageRequest()
+ *
+ * // Custom:
+ * val second = PageRequest(page = 2, size = 50)
+ *
+ * // Invalid — throws at construction:
+ * // PageRequest(page = -1) // IllegalArgumentException
+ * // PageRequest(size = 0)  // IllegalArgumentException
+ * ```
  */
 public data class PageRequest(
     val page: Int = 0,
@@ -55,6 +82,18 @@ public data class PageRequest(
  * - [findPage] is a suspend one-shot query, matching the typical API call pattern.
  *
  * [T] — the domain model type.
+ *
+ * Example:
+ * ```kotlin
+ * interface ProductRepository : PaginatedRepository<Product>
+ *
+ * // Call site:
+ * val page = productRepo.findPage(PageRequest(page = 0, size = 20))
+ * page.onSuccess { result ->
+ *     showProducts(result.items)
+ *     if (result.hasNext) enableLoadMore()
+ * }
+ * ```
  */
 public interface PaginatedRepository<out T> : Repository {
     public suspend fun findPage(request: PageRequest): DomainResult<Page<T>>

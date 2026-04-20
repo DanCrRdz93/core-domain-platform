@@ -14,6 +14,18 @@ package com.domain.core.model
  *   explicitly override equality based on [id].
  * - No mutable state. Domain entities must be immutable; mutations produce
  *   new instances via `copy()`.
+ *
+ * Example:
+ * ```kotlin
+ * data class User(
+ *     override val id: UserId,
+ *     val name: String,
+ *     val email: String,
+ * ) : Entity<UserId>
+ *
+ * // Mutations produce new instances:
+ * val updated = user.copy(name = "New Name")
+ * ```
  */
 public interface Entity<out ID> {
     public val id: ID

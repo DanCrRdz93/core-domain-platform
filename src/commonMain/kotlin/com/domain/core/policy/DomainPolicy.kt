@@ -24,6 +24,22 @@ import com.domain.core.result.domainFailure
  *   an external state), implement [SuspendDomainPolicy] instead.
  *
  * [C] — the context type the policy evaluates (an aggregate, a command, a value object).
+ *
+ * Example — single policy:
+ * ```kotlin
+ * val canPlaceOrder = DomainPolicy<Order> { order ->
+ *     if (order.items.isNotEmpty()) Unit.asSuccess()
+ *     else domainFailure(DomainError.Validation("items", "Order must have at least one item"))
+ * }
+ *
+ * canPlaceOrder.evaluate(myOrder)
+ * ```
+ *
+ * Example — composing policies:
+ * ```kotlin
+ * val canCheckout = canPlaceOrder and hasValidPayment and isUnderCreditLimit
+ * canCheckout.evaluate(myOrder)
+ * ```
  */
 public fun interface DomainPolicy<in C> {
     public fun evaluate(context: C): DomainResult<Unit>
@@ -39,6 +55,19 @@ public fun interface DomainPolicy<in C> {
  * - Callers that accept [DomainPolicy] remain pure; callers that accept
  *   [SuspendDomainPolicy] are explicitly async. This prevents accidental
  *   I/O inside synchronous evaluation paths.
+ *
+ * Example:
+ * ```kotlin
+ * class UniqueEmailPolicy(
+ *     private val userRepo: UserRepository,
+ * ) : SuspendDomainPolicy<String> {
+ *     override suspend fun evaluate(context: String): DomainResult<Unit> {
+ *         val exists = userRepo.existsByEmail(context).getOrNull() ?: false
+ *         return if (!exists) Unit.asSuccess()
+ *         else domainFailure(DomainError.Conflict("Email '$context' already registered"))
+ *     }
+ * }
+ * ```
  */
 public fun interface SuspendDomainPolicy<in C> {
     public suspend fun evaluate(context: C): DomainResult<Unit>
@@ -49,6 +78,12 @@ public fun interface SuspendDomainPolicy<in C> {
 /**
  * Returns a policy that is satisfied only when both [this] and [other] are satisfied.
  * Evaluation is fail-fast: [other] is not evaluated if [this] fails.
+ *
+ * Example:
+ * ```kotlin
+ * val canShip = hasStock and hasValidAddress
+ * canShip.evaluate(order) // fails at first unsatisfied policy
+ * ```
  */
 public infix fun <C> DomainPolicy<C>.and(other: DomainPolicy<C>): DomainPolicy<C> =
     DomainPolicy { context ->
@@ -59,6 +94,12 @@ public infix fun <C> DomainPolicy<C>.and(other: DomainPolicy<C>): DomainPolicy<C
 /**
  * Returns a policy that is satisfied when either [this] or [other] is satisfied.
  * [other] is only evaluated when [this] fails.
+ *
+ * Example:
+ * ```kotlin
+ * val canPay = hasCreditCard or hasPayPal
+ * canPay.evaluate(user) // succeeds if either payment method exists
+ * ```
  */
 public infix fun <C> DomainPolicy<C>.or(other: DomainPolicy<C>): DomainPolicy<C> =
     DomainPolicy { context ->
@@ -73,6 +114,14 @@ public infix fun <C> DomainPolicy<C>.or(other: DomainPolicy<C>): DomainPolicy<C>
  * policy should therefore fail), producing the [DomainError] that describes why
  * the negation is violated. This signature prevents the accidental mistake of
  * passing a [DomainResult.Success] as the failure result.
+ *
+ * Example:
+ * ```kotlin
+ * val isNotBanned = isBanned.negate {
+ *     DomainError.Unauthorized("User is banned and cannot perform this action")
+ * }
+ * isNotBanned.evaluate(user)
+ * ```
  */
 public fun <C> DomainPolicy<C>.negate(
     onSatisfied: () -> DomainError,
