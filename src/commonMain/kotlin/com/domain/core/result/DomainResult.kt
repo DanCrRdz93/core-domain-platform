@@ -39,7 +39,7 @@ public fun <T> DomainResult<T>.getOrNull(): T? =
 public fun <T> DomainResult<T>.errorOrNull(): DomainError? =
     (this as? DomainResult.Failure)?.error
 
-public fun <T> DomainResult<T>.getOrElse(default: (DomainError) -> T): T = when (this) {
+public inline fun <T> DomainResult<T>.getOrElse(default: (DomainError) -> T): T = when (this) {
     is DomainResult.Success -> value
     is DomainResult.Failure -> default(error)
 }
