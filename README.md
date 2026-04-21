@@ -13,8 +13,8 @@ y Clean Architecture forzada a nivel del compilador.
 
 ```
 Targets: JVM · Android · iOS (arm64, x64, simulator)
-Lenguaje: Kotlin 2.1.20 · KMP
-Dependencias: kotlinx-coroutines-core 1.10.1 (única)
+Lenguaje: Kotlin 2.3.10 · KMP
+Dependencias: kotlinx-coroutines-core 1.10.2 (única)
 ```
 
 ---
@@ -35,6 +35,7 @@ Dependencias: kotlinx-coroutines-core 1.10.1 (única)
 - [Referencia de Manejo de Errores](#referencia-de-manejo-de-errores)
 - [Estrategia de Testing](#estrategia-de-testing)
 - [Versionado](#versionado)
+- [Changelog](#changelog)
 
 ---
 
@@ -2570,6 +2571,17 @@ Consulta [ARCHITECTURE.md](ARCHITECTURE.md) para principios de diseño e
 
 ---
 
+## Changelog
+
+| Versión | Fecha | Kotlin | Coroutines | Cambios |
+|---|---|---|---|---|
+| **1.1.0** | 2026-04-21 | 2.3.10 | 1.10.2 | Actualización de compilador a Kotlin 2.3.10 para compatibilidad con K/Native. Bump de vanniktech 0.35.0 → 0.36.0. Sin cambios en la API pública. |
+| **1.0.2** | 2025-12-xx | 2.1.20 | 1.10.1 | Documentación KDoc completa con ejemplos de uso en todas las APIs públicas. |
+| **1.0.1** | 2025-12-xx | 2.1.20 | 1.10.1 | Marcado `getOrElse` como `inline` para non-local returns. Corrección de error "Project name is missing" en Maven Central. |
+| **1.0.0** | 2025-12-xx | 2.1.20 | 1.10.1 | Release inicial. Contratos de dominio: DomainResult, DomainError, Repository, Gateway, UseCase, Mapper, Validator, Policy, DomainEvent, Streaming. |
+
+---
+
 ## Licencia
 
 Apache License 2.0 — ver [LICENSE](LICENSE).
@@ -2585,8 +2597,8 @@ and Clean Architecture enforced at the compiler level.
 
 ```
 Targets: JVM · Android · iOS (arm64, x64, simulator)
-Language: Kotlin 2.1.20 · KMP
-Dependencies: kotlinx-coroutines-core 1.10.1 (only)
+Language: Kotlin 2.3.10 · KMP
+Dependencies: kotlinx-coroutines-core 1.10.2 (only)
 ```
 
 ---
@@ -5096,6 +5108,17 @@ This SDK follows [Semantic Versioning](https://semver.org/):
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design principles and
 [INTEGRATION.md](INTEGRATION.md) for data-layer boundary rules.
+
+---
+
+## Changelog
+
+| Version | Date | Kotlin | Coroutines | Changes |
+|---|---|---|---|---|
+| **1.1.0** | 2026-04-21 | 2.3.10 | 1.10.2 | Compiler update to Kotlin 2.3.10 for K/Native klib compatibility. Bump vanniktech 0.35.0 → 0.36.0. No public API changes. |
+| **1.0.2** | 2025-12-xx | 2.1.20 | 1.10.1 | Comprehensive KDoc documentation with usage examples on all public APIs. |
+| **1.0.1** | 2025-12-xx | 2.1.20 | 1.10.1 | Marked `getOrElse` as `inline` for non-local returns. Fixed "Project name is missing" Maven Central error. |
+| **1.0.0** | 2025-12-xx | 2.1.20 | 1.10.1 | Initial release. Domain contracts: DomainResult, DomainError, Repository, Gateway, UseCase, Mapper, Validator, Policy, DomainEvent, Streaming. |
 
 ---
 
