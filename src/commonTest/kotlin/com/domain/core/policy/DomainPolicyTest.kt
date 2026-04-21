@@ -149,13 +149,13 @@ class DomainPolicyTest {
     // ── Mixed and/or composition ───────────────────────────────────────────────
 
     @Test
-    fun `and combined with or — (satisfied and violated) or satisfied = Success`() {
+    fun `and combined with or — satisfied and violated or satisfied = Success`() {
         val combined = (alwaysSatisfied and alwaysViolated) or alwaysSatisfied
         assertIs<DomainResult.Success<Unit>>(combined.evaluate(1))
     }
 
     @Test
-    fun `or combined with and — (violated or satisfied) and satisfied = Success`() {
+    fun `or combined with and — violated or satisfied and satisfied = Success`() {
         val combined = (alwaysViolated or alwaysSatisfied) and alwaysSatisfied
         assertIs<DomainResult.Success<Unit>>(combined.evaluate(1))
     }

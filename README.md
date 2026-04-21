@@ -1,8 +1,8 @@
 # Core Domain Platform SDK
 
-![Version](https://img.shields.io/badge/version-1.0.2-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![Maven Central](https://img.shields.io/maven-central/v/io.github.dancrrdz93/coredomainplatform)
-![Kotlin](https://img.shields.io/badge/Kotlin-2.1.20-purple)
+![Kotlin](https://img.shields.io/badge/Kotlin-2.3.10-purple)
 ![Platform](https://img.shields.io/badge/platform-JVM%20%7C%20Android%20%7C%20iOS-green)
 
 > **Idioma / Language:** 🇪🇸 [Español](#tabla-de-contenidos) (predeterminado) · 🇺🇸 [English](#english-version)
@@ -44,7 +44,7 @@ Dependencias: kotlinx-coroutines-core 1.10.1 (única)
 
 ```kotlin
 dependencies {
-    implementation("io.github.dancrrdz93:coredomainplatform:1.0.2")
+    implementation("io.github.dancrrdz93:coredomainplatform:1.1.0")
 }
 ```
 
@@ -52,7 +52,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'io.github.dancrrdz93:coredomainplatform:1.0.2'
+    implementation 'io.github.dancrrdz93:coredomainplatform:1.1.0'
 }
 ```
 
@@ -60,7 +60,7 @@ dependencies {
 
 ```toml
 [versions]
-coreDomainPlatform = "1.0.2"
+coreDomainPlatform = "1.1.0"
 
 [libraries]
 core-domain-platform = { group = "io.github.dancrrdz93", name = "coredomainplatform", version.ref = "coreDomainPlatform" }
@@ -2597,7 +2597,7 @@ Dependencies: kotlinx-coroutines-core 1.10.1 (only)
 
 ```kotlin
 dependencies {
-    implementation("io.github.dancrrdz93:coredomainplatform:1.0.2")
+    implementation("io.github.dancrrdz93:coredomainplatform:1.1.0")
 }
 ```
 
@@ -2605,7 +2605,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'io.github.dancrrdz93:coredomainplatform:1.0.2'
+    implementation 'io.github.dancrrdz93:coredomainplatform:1.1.0'
 }
 ```
 
@@ -2613,7 +2613,7 @@ dependencies {
 
 ```toml
 [versions]
-coreDomainPlatform = "1.0.2"
+coreDomainPlatform = "1.1.0"
 
 [libraries]
 core-domain-platform = { group = "io.github.dancrrdz93", name = "coredomainplatform", version.ref = "coreDomainPlatform" }
