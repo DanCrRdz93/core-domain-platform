@@ -199,3 +199,78 @@ public fun <T : Comparable<T>> rangeValidator(
         )
     )
 }
+
+/**
+ * Validates that a nullable value is not `null`.
+ *
+ * Example:
+ * ```kotlin
+ * val validator: Validator<String?> = requireNotNullValidator("phone")
+ * validator.validate(null)   // Failure: "'phone' is required."
+ * validator.validate("+52")  // Success
+ * ```
+ */
+public fun <T : Any> requireNotNullValidator(field: String): Validator<T?> = Validator { value ->
+    if (value != null) Unit.asSuccess()
+    else domainFailure(
+        DomainError.Validation(field = field, detail = "is required.")
+    )
+}
+
+// ── Combinators ───────────────────────────────────────────────────────────────
+
+/**
+ * Adapts a [Validator] of [U] into a [Validator] of [T] by extracting the value to validate.
+ *
+ * Useful for validating a property of an object without writing a new [Validator] from scratch.
+ *
+ * Example — validating a field of a form:
+ * ```kotlin
+ * data class CreateUser(val name: String, val email: String)
+ *
+ * val nameValidator: Validator<CreateUser> =
+ *     notBlankValidator("name").contramap { it.name }
+ * ```
+ */
+public fun <T, U> Validator<U>.contramap(extract: (T) -> U): Validator<T> = Validator { value ->
+    validate(extract(value))
+}
+
+/**
+ * Lifts a single-element [Validator] into one that validates every element of a [List].
+ *
+ * Fail-fast: the first failing element short-circuits and its error is reported.
+ * For accumulate-all-errors semantics, see [traverseCollectingErrors].
+ *
+ * Example:
+ * ```kotlin
+ * val emailListValidator = emailValidator.traverse()
+ * val result = emailListValidator.validate(listOf("a@b", "invalid", "c@d"))
+ * // Failure on "invalid" — does not check "c@d"
+ * ```
+ */
+public fun <T> Validator<T>.traverse(): Validator<List<T>> = Validator { values ->
+    for (value in values) {
+        val result = validate(value)
+        if (result is DomainResult.Failure) return@Validator result
+    }
+    Unit.asSuccess()
+}
+
+/**
+ * Runs [this] validator against every element of [values] and returns all failures.
+ * Returns an empty list when all elements pass.
+ *
+ * Prefer this over [traverse] when the call site needs to surface every offending item
+ * (e.g. submitting a form with multiple invitee rows).
+ *
+ * Example:
+ * ```kotlin
+ * val errors = emailValidator.traverseCollectingErrors(
+ *     listOf("a@b.com", "missing-at", "c@d.com")
+ * )
+ * // errors.size == 1, only for "missing-at"
+ * ```
+ */
+public fun <T> Validator<T>.traverseCollectingErrors(values: List<T>): List<DomainError> =
+    values.mapNotNull { (validate(it) as? DomainResult.Failure)?.error }
