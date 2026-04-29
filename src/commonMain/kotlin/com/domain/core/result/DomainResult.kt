@@ -327,6 +327,95 @@ public inline fun <A, B, C, R> DomainResult<A>.zip(
     else -> c as DomainResult.Failure
 }
 
+/**
+ * Combines four [DomainResult] values. See [zip] for design rationale.
+ *
+ * Example:
+ * ```kotlin
+ * val profile = a.zip(b, c, d) { w, x, y, z -> Profile(w, x, y, z) }
+ * ```
+ */
+public inline fun <A, B, C, D, R> DomainResult<A>.zip(
+    b: DomainResult<B>,
+    c: DomainResult<C>,
+    d: DomainResult<D>,
+    transform: (A, B, C, D) -> R,
+): DomainResult<R> = when {
+    this is DomainResult.Success && b is DomainResult.Success && c is DomainResult.Success && d is DomainResult.Success ->
+        transform(value, b.value, c.value, d.value).asSuccess()
+    this is DomainResult.Failure -> this
+    b is DomainResult.Failure -> b
+    c is DomainResult.Failure -> c
+    else -> d as DomainResult.Failure
+}
+
+// ── Recovery & List operations ──────────────────────────────────────────────
+
+/**
+ * Returns this [DomainResult] unchanged if it is [DomainResult.Success];
+ * otherwise applies [transform] to recover with a different result.
+ *
+ * Use to selectively rescue failures (e.g. fall back to cache on `Network` errors,
+ * but propagate `Validation` errors to the UI).
+ *
+ * Example:
+ * ```kotlin
+ * networkLoad().recover { error ->
+ *     if (error is DomainError.Infrastructure) loadFromCache()
+ *     else domainFailure(error) // re-raise non-recoverable errors
+ * }
+ * ```
+ */
+public inline fun <T> DomainResult<T>.recover(
+    transform: (DomainError) -> DomainResult<T>,
+): DomainResult<T> = when (this) {
+    is DomainResult.Success -> this
+    is DomainResult.Failure -> transform(error)
+}
+
+/**
+ * Converts a [List] of [DomainResult] into a [DomainResult] of [List].
+ * Fail-fast: short-circuits on the first [DomainResult.Failure] and returns it.
+ *
+ * Example:
+ * ```kotlin
+ * val results: List<DomainResult<User>> = ids.map { fetchUser(it) }
+ * val all: DomainResult<List<User>> = results.sequence()
+ * ```
+ */
+public fun <T> List<DomainResult<T>>.sequence(): DomainResult<List<T>> {
+    val accumulator = ArrayList<T>(size)
+    for (result in this) {
+        when (result) {
+            is DomainResult.Success -> accumulator.add(result.value)
+            is DomainResult.Failure -> return result
+        }
+    }
+    return accumulator.asSuccess()
+}
+
+/**
+ * Maps each element of [this] with [transform] (which may fail) and gathers the results.
+ * Equivalent to `map(transform).sequence()` but avoids the intermediate list.
+ *
+ * Example:
+ * ```kotlin
+ * val parsed: DomainResult<List<Int>> = inputs.traverse { parseAge(it) }
+ * ```
+ */
+public inline fun <T, R> List<T>.traverse(
+    transform: (T) -> DomainResult<R>,
+): DomainResult<List<R>> {
+    val accumulator = ArrayList<R>(size)
+    for (item in this) {
+        when (val result = transform(item)) {
+            is DomainResult.Success -> accumulator.add(result.value)
+            is DomainResult.Failure -> return result
+        }
+    }
+    return accumulator.asSuccess()
+}
+
 // ── Lifting ──────────────────────────────────────────────────────────────────
 
 /**
@@ -362,6 +451,32 @@ public inline fun <A, B, C, R> DomainResult<A>.zip(
 public suspend fun <T> runDomainCatching(
     errorMapper: (Throwable) -> DomainError = { DomainError.Unknown(cause = it) },
     block: suspend () -> T,
+): DomainResult<T> = try {
+    block().asSuccess()
+} catch (e: CancellationException) {
+    throw e
+} catch (e: Throwable) {
+    DomainResult.Failure(errorMapper(e))
+}
+
+/**
+ * Non-suspend overload of [runDomainCatching] for synchronous code paths
+ * (e.g. in-memory parsing, cache lookups, validation that does not perform I/O).
+ *
+ * Same semantics as [runDomainCatching], minus the suspend modifier.
+ *
+ * Example:
+ * ```kotlin
+ * val parsed: DomainResult<Int> = runDomainCatchingSync(
+ *     errorMapper = { DomainError.Validation("age", "must be a number") },
+ * ) {
+ *     input.toInt()
+ * }
+ * ```
+ */
+public inline fun <T> runDomainCatchingSync(
+    errorMapper: (Throwable) -> DomainError = { DomainError.Unknown(cause = it) },
+    block: () -> T,
 ): DomainResult<T> = try {
     block().asSuccess()
 } catch (e: CancellationException) {

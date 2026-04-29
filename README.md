@@ -1,6 +1,6 @@
 # Core Domain Platform SDK
 
-![Version](https://img.shields.io/badge/version-1.1.0-blue)
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
 ![Maven Central](https://img.shields.io/maven-central/v/io.github.dancrrdz93/coredomainplatform)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.3.10-purple)
 ![Platform](https://img.shields.io/badge/platform-JVM%20%7C%20Android%20%7C%20iOS-green)
@@ -45,7 +45,7 @@ Dependencias: kotlinx-coroutines-core 1.10.2 (única)
 
 ```kotlin
 dependencies {
-    implementation("io.github.dancrrdz93:coredomainplatform:1.1.0")
+    implementation("io.github.dancrrdz93:coredomainplatform:1.2.0")
 }
 ```
 
@@ -53,7 +53,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'io.github.dancrrdz93:coredomainplatform:1.1.0'
+    implementation 'io.github.dancrrdz93:coredomainplatform:1.2.0'
 }
 ```
 
@@ -61,7 +61,7 @@ dependencies {
 
 ```toml
 [versions]
-coreDomainPlatform = "1.1.0"
+coreDomainPlatform = "1.2.0"
 
 [libraries]
 core-domain-platform = { group = "io.github.dancrrdz93", name = "coredomainplatform", version.ref = "coreDomainPlatform" }
@@ -2575,6 +2575,7 @@ Consulta [ARCHITECTURE.md](ARCHITECTURE.md) para principios de diseño e
 
 | Versión | Fecha | Kotlin | Coroutines | Cambios |
 |---|---|---|---|---|
+| **1.2.0** | 2026-04-29 | 2.3.10 | 1.10.2 | **Aditivo (sin breaking)**. Nuevos combinadores en `Validator`: `traverse()`, `traverseCollectingErrors()`, `contramap()`, `requireNotNullValidator()`. Nuevas operaciones en `DomainResult`: `recover { ... }`, `List<DomainResult<T>>.sequence()`, `List<T>.traverse { ... }`, `zip` 4-arity. Nuevo `runDomainCatchingSync` (overload no-suspend). Sin cambios en la API existente. |
 | **1.1.0** | 2026-04-21 | 2.3.10 | 1.10.2 | Actualización de compilador a Kotlin 2.3.10 para compatibilidad con K/Native. Bump de vanniktech 0.35.0 → 0.36.0. Sin cambios en la API pública. |
 | **1.0.2** | 2025-12-xx | 2.1.20 | 1.10.1 | Documentación KDoc completa con ejemplos de uso en todas las APIs públicas. |
 | **1.0.1** | 2025-12-xx | 2.1.20 | 1.10.1 | Marcado `getOrElse` como `inline` para non-local returns. Corrección de error "Project name is missing" en Maven Central. |
@@ -2609,7 +2610,7 @@ Dependencies: kotlinx-coroutines-core 1.10.2 (only)
 
 ```kotlin
 dependencies {
-    implementation("io.github.dancrrdz93:coredomainplatform:1.1.0")
+    implementation("io.github.dancrrdz93:coredomainplatform:1.2.0")
 }
 ```
 
@@ -2617,7 +2618,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'io.github.dancrrdz93:coredomainplatform:1.1.0'
+    implementation 'io.github.dancrrdz93:coredomainplatform:1.2.0'
 }
 ```
 
@@ -2625,7 +2626,7 @@ dependencies {
 
 ```toml
 [versions]
-coreDomainPlatform = "1.1.0"
+coreDomainPlatform = "1.2.0"
 
 [libraries]
 core-domain-platform = { group = "io.github.dancrrdz93", name = "coredomainplatform", version.ref = "coreDomainPlatform" }
@@ -5115,6 +5116,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design principles and
 
 | Version | Date | Kotlin | Coroutines | Changes |
 |---|---|---|---|---|
+| **1.2.0** | 2026-04-29 | 2.3.10 | 1.10.2 | **Additive (no breaks)**. New combinators on `Validator`: `traverse()`, `traverseCollectingErrors()`, `contramap()`, `requireNotNullValidator()`. New `DomainResult` operations: `recover { ... }`, `List<DomainResult<T>>.sequence()`, `List<T>.traverse { ... }`, 4-arity `zip`. New `runDomainCatchingSync` (non-suspend overload). No changes to existing API. |
 | **1.1.0** | 2026-04-21 | 2.3.10 | 1.10.2 | Compiler update to Kotlin 2.3.10 for K/Native klib compatibility. Bump vanniktech 0.35.0 → 0.36.0. No public API changes. |
 | **1.0.2** | 2025-12-xx | 2.1.20 | 1.10.1 | Comprehensive KDoc documentation with usage examples on all public APIs. |
 | **1.0.1** | 2025-12-xx | 2.1.20 | 1.10.1 | Marked `getOrElse` as `inline` for non-local returns. Fixed "Project name is missing" Maven Central error. |
